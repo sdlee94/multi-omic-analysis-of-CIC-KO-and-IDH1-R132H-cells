@@ -1,0 +1,849 @@
+---
+title: "CIC Project: Histone ChIP-seq QC Analysis"
+author: "Stephen Lee"
+date: '`r format(Sys.time(), "%B %d, %Y")`'
+output: html_document
+---
+
+## Table of Contents
+
+----
+[**Overview**](#overview)    
+  - [Submissions](#subs)    
+  - [Resources](#refs)    
+
+[**Pre-processing**](#pre)    
+  - [Setting up directory](#dir)    
+  - [Processing BAM files](#bams) 
+
+[**QC Analysis**](#qc)    
+  - [Flagstats](#stats)    
+  - [Visualizing BigWig Files](#bw)    
+  - [Correlations Between Samples](#corr)    
+  - [Fingerprints](#fprint)    
+  - [Cross Correlation Analysis](#cross)    
+  - [FindER Peaks QC](#fpeaks)    
+  - [MACS2 Peaks QC](#mpeaks) 
+
+2. [**Section 1:** using Make](#section1)
+    - [Setting up directory](#dir)
+    - [Processing BAM files](#bams)    
+    - [Coverage across Chromosome 1](#chr1)
+    - [Peak calling](#peakcall)
+    - [Coverage in peaks](#peakcov)
+    - [Coverage across TSS](#tsscov)
+    - [Jaccard indeces](#jaccard)
+3. [**Section 2:** using R](#section2)
+    - [BAM file summary](#stats)
+    - [Normalized coverage across Chromosome 1](#chr1res)
+    - [Jaccard indeces for peaks](#jaccres)
+    - [Number of peaks](#peaknum)
+    - [Distribution of peaks across chromosomes](#peakdist)
+    - [General peak attributes](#peakatt)
+    - [Proportion of reads contributing to peaks](#peakcon)
+    - [IP - input fold enrichments](#peakfe)
+    - [Cumulative distribution of peak q-values](#peakcdf)
+    - [Coverage across TSS regions](#tssres)
+4. [Summary](#summ)
+
+## Overview <a name="overview"></a>
+
+----
+
+**What are the consequences of *CIC* loss on the histone modification landscape in a wildtype and neomorphic IDH1 background?**  
+To address this question, isogenic *CIC* wildtype and knockout cell lines expressing wildtype IDH1 (NHA) or IDH1-R132H (F8) were submitted to the GSC (2 replicates each) where ChIP-seq was performed using antibodies against H3K4me1, H3K4me3, H3K27ac, H3K27me3, H3K9me3, H3K36me3. 
+
+**Experimental Model:**
+
+Cell Line   | CIC Status  | IDH1 Status
+----------- | ----------- | -----------
+NHA         | WT          | WT
+NHAA2       | KO          | WT
+NHAH9       | KO          | WT
+F8          | WT          | R132H
+F8A2        | KO          | R132H
+F8E10       | KO          | R132H
+
+### **Submissions** <a name="subs"></a>
+
+> The GSC submission form can be found here: ```/home/sdlee/projects/CIC_prj/GSC_Submissions/Marra_GSC-1349C_Tissue-Submission_Form_06Oct2017.xls```
+
+> A file listing the full path to GSC BAM files for each library can be found here: ```/projects/marralab_cic_prj/histone_mod_chip/libs.tsv```
+
+### **Resources**
+
+Much of the code for performing QC was written by James Topham. Most of the R code was re-written by me in my preferred style of coding, both for my personal practice and to see whether I could reproduce the results. [QC Tutorial by James Topham](/projects/sdlee_prj/sdlee/reports/QC/cic_qc_tutorial.html)
+
+#### **Load Libraries and Set Path Variables**
+
+```{r, message=F, warning=F}
+library(tidyverse)
+library(data.table)
+library(knitr)
+library(forcats)
+library(cowplot)
+library(ggrepel)
+library(RColorBrewer)
+setwd("/projects/sdlee_prj/sdlee")
+figs_path <- ("/projects/sdlee_prj/sdlee/reports/QC/figs/histone_ChIP/")
+wd <- "/projects/marralab_cic_prj/histone_mod_chip/"
+```
+
+### **Directory structure** <a name="dir"></a>
+
+The first step in the Makefile is setting up the working directory. We do this in a way that makes downstream Makefile recipes easier to write. For example, all BAM files have identical names (*gsc.bam*), and they are distinguished solely by their filepath. Another important aspect was library names - which are named via: cellline_rep_mark. This way, we can easily parse library names for individual attributes (like which mark or replicate each pertains to) using simple [regex patterns](https://en.wikipedia.org/wiki/Regular_expression).
+
+Here's the Makefile code used to create the directory structure, and link GSC BAM files. Note that these BAMs are [symbolically linked](https://kb.iu.edu/d/abbe), rather than copied, since we will generate our own *"hardcopy"* version of these BAMs in the next section.
+
+```
+libs = $(shell cut -f 1 libs.tsv)
+lib_locs = $(shell cat libs.tsv | awk '{print$$1"__"$$2}')
+
+setupdir = $(foreach lib, ${libs}, $(lib)/bam)
+dir : ${setupdir}
+
+# create directory structure
+%/bam :
+       	mkdir $*; mkdir $*/bam; mkdir $*/peaks;
+
+# import gsc bam files
+get_bams = $(foreach lib_loc, ${lib_locs}, $(lib_loc)/bam/gsc.bam)
+getbams : ${get_bams}
+
+%/bam/gsc.bam :
+        lib=$$(echo $* | awk '{ gsub("__.*", ""); print }'); \
+        loc=$$(echo $* | awk '{ gsub(".*__", ""); print }'); \
+        ln -s $${loc} $${lib}/bam/gsc.bam
+```
+
+Libraries and their filepaths are separated using "__". This way, we can still loop on each library, and in each iteration, pull out the library name and its filepath using an easy *gsub*.
+
+### **Processing BAM files** <a name="bams"></a>
+
+Here we filter out unmapped reads, sort and index the BAM files to generate our own hard copy.
+
+```
+filter_sort = $(foreach lib, ${libs}, $(lib)/bam/gsc.sorted.bam)
+sortbams : ${filter_sort}
+
+# filter unmapped reads; sort and index
+%/bam/gsc.sorted.bam :
+        samtools sort $*/bam/gsc.bam $*/bam/gsc.sorted; \
+        samtools index $*/bam/gsc.sorted.bam \
+        $*/bam/gsc.sorted.bam.bai
+```
+
+### **Flagstats** <a name="stats"></a>
+
+Here, we obtain general information on each BAM file using *samtools flagstat* which will be used for intial QC purposes. 
+
+```
+flagstat_loop = $(foreach lib, ${libs}, $(lib)/bam/flagstat.txt)
+flagstat : ${flagstat_loop}
+
+# flagstat
+%/bam/flagstat.txt :
+        samtools flagstat $*/bam/gsc.bam > $@
+```
+
+Import into R and plot.
+
+```
+read_flagstats <- function(flagstats) {
+	files <- read.delim(flagstats, sep = '\t', header = F, stringsAsFactors = F) %>% 
+		mutate(lib = str_split(flagstats, "/", simplify = T)[, 5]) %>% 
+		group_by(lib) %>% 
+		mutate(total = as.integer(str_replace(first(V1), " .*", "")),
+					 mapped = as.integer(str_replace(nth(V1, 3), " .*", "")),
+					 perc = as.numeric(str_replace(str_replace(nth(V1, 3), ".* \\(", ""), "%:.*", "")),
+					 qc_fail = as.integer(str_replace(str_replace(first(V1), ".*[0-9] [+] ", ""), " in.*", "")),
+					 dupe = as.integer(str_replace(nth(V1, 2), " .*", "")),
+					 NRF = (mapped - dupe) / mapped) %>% 
+		select(-V1) %>% 
+		unique() %>%
+		rowwise() %>%
+		mutate(dupe_perc = dupe / mapped * 100)
+	
+	return(files)
+}
+
+flagstats <- str_c(wd, str_subset(dir(wd), "rep"), "/bam/flagstat.txt") %>% 
+	map(read_flagstats) %>% 
+	bind_rows() %>% 
+	separate(lib, c("sample", "rep", "mark"), sep = "_", remove = F)
+
+saveRDS(flagstats, str_c(wd, "R_objects/flagstats.rds"))
+flagstats <- readRDS("/projects/marralab_cic_prj/histone_mod_chip/R_objects/flagstats.rds")
+
+flag_m <- function(x) {
+  df <- x %>% 
+    select(-dupe) %>% 
+    melt()
+  
+  df$variable <- as.character(df$variable)
+  df$variable[df$variable == "total"] <- "# QC-passed Reads"
+  df$variable[df$variable == "mapped"] <- "# Mapped Reads"
+  df$variable[df$variable == "perc"] <- "% Reads Mapped"
+  df$variable[df$variable == "qc_fail"] <- "# QC-failed Reads"
+  df$variable[df$variable == "dupe_perc"] <- "% Duplicate Reads"
+  df$variable[df$variable == "NRF"] <- "Non-Redundant Fraction"
+  df$variable <- factor(df$variable, levels = c("# Mapped Reads", "% Reads Mapped", "# QC-passed Reads", 
+                                                "# QC-failed Reads", "% Duplicate Reads", "Non-Redundant Fraction"))
+                                                
+  return(df)
+}
+
+flagstats_m <- flag_m(flagstats) %>% 
+  mutate(mark = as.factor(mark))
+saveRDS(flagstats_m, str_c(wd, "R_objects/flagstats_m.rds"))
+flagstats_m <- readRDS("/projects/marralab_cic_prj/histone_mod_chip/R_objects/flagstats_m.rds")
+
+hmark_colors <- c("springgreen2", "springgreen4", "steelblue3", "goldenrod1", "firebrick2", "darkorchid3", "snow3")
+
+my_theme <- theme(axis.text = element_text(size = 18, colour = "black"),
+                  axis.title = element_text(size = 20),
+                  panel.background = element_rect(fill = "white", colour = "black"),
+                  panel.grid.major.y = element_line(colour = "gainsboro"))
+
+pdf(file = str_c(figs_path, "flagstats.pdf"), width = 12)
+ggplot(flagstats_m, aes(x = variable, y = value, col = mark, shape = sample)) + 
+  geom_jitter(width = 0.1, alpha = 0.6, size = 4) +
+  scale_color_manual(values = hmark_colors) +
+  facet_wrap(~variable, scales = "free") +
+	labs(x = NULL, y = NULL, col = "Mark", shape = "Sample") +
+  theme(axis.text.x = element_blank(),
+        strip.text = element_text(size = 14, color = "black", face = "bold"),
+        legend.text = element_text(size = 14),
+        legend.title = element_text(size = 16, face = "bold")) +
+  my_theme
+dev.off()
+```
+
+<center><img src="figs/histone_ChIP/flagstats.pdf">
+<br><a href="figs/histone_ChIP/flagstats.pdf">(Download pdf)</A></center>   
+
+### **Coverage across Chromosome 1** <a name="chr1_cov"></a>
+
+As part of his QC pipeline, Misha Bilenky looks at IP and (matched) input coverage across broad sections of the genome. This allows the viewer to get a sense of the general distribution of the data, ie. how **peaky** the IPs are and how **uniform** their inputs are. We will perform this on a broad section of chromosome 1.    
+
+To do this experiment, we first need to bin chromosome 1 into non-overlapping bins of equal size (175 bp) using *bedtools windowMaker*. Then, given these bins, we will calculate the coverage of each library in each bin using *bedtools coverageBed*.
+
+```
+# bin chromosome 1 into 175 bp bins
+./chr1_175bp.bed :
+        ${bedtools}/windowMaker -g ${pd}/hg19_chromsizes.tsv -w 175 | \
+        grep ^1 | grep -v ^1[0-9] | \
+        ${bedops}/sort-bed --max-mem 20G --tmpdir ./tmp - > $@
+
+# convert BAM files to BEDs, find read centers, then calculate how many read
+# centers in each 175 bp bin
+gcov = $(foreach lib, ${libs}, ./$(lib)/bam/cov_in_genomebins.bed)
+gcovs : ${gcov}
+
+%/bam/cov_in_genomebins.bed :
+        ${bedops}/convert2bed --max-mem=12G --sort-tmpdir=./tmp \
+        --input=bam < $*/bam/gsc.bam | cut -f 1-3 | \
+        awk '{printf("${PERCENT}i\t${PERCENT}i\n",$$1, ((($$3 - $$2)/2) + \
+        $$2))}' | awk '{print $$1"\t"$$2"\t"$$2 + 1}' | \
+        ${bedops}/sort-bed --max-mem 20G --tmpdir ./tmp - | \
+        ${bedtools}/coverageBed -a - -b ./chr1_175bp.bed -counts > $@
+```
+
+In R, coverage is normalized using SPKM (signal per million mapped reads per thousand bp) which corrects for both sequencing depth (deeper libraries inherently benefit from higher coverage) and the size of the region (bigger regions will have a higher coverage due to random chance) and then plotted.
+
+SPKM is calculated via:
+
+```
+(raw coverage x 1e3 x 1e6) / (size of region x number of mapped reads)
+```
+
+We also calculate the Spearman correlation which measures how similar the matched IP / input pairs are in these regions. This value should not be too high, although there are not any published recommendations (values should not exceed 0.5 to deem a library to be 'good' according to Misha).
+
+```
+libpairs <- fread(str_c(wd, "lib_pairs.tsv"), sep = '\t', header = F, stringsAsFactors = F) %>% 
+  unite(sep = ":") %>% unlist()
+
+read_cov_in_chr1 <- function(x) {
+  ip <- gsub(":.*", "", x)
+  input <- gsub(".*:", "", x)
+  
+  mapped_ip <- flagstats[flagstats$lib == ip, ]$mapped
+  mapped_input <- flagstats[flagstats$lib == input, ]$mapped
+  
+  col_names <- c("chr", "start", "end", "cov")
+  
+  df_IP <- fread(str_c(wd, ip, "/bam/cov_in_genomebins.bed"), sep = '\t', header = F, stringsAsFactors = F, col.names = col_names) %>% 
+    mutate(type = "ip", lib = ip)
+  
+  df_input <- fread(str_c(wd, input, "/bam/cov_in_genomebins.bed"), sep = '\t', header = F, stringsAsFactors = F, col.names = col_names) %>% 
+    mutate(type = "input", lib = input)
+  
+  df_pair <- rbind(df_IP, df_input)%>% 
+    mutate(pos = start + 87.5,
+           norm = if_else(type == "ip", (cov * 1e9) / (mapped_ip * 175), (cov * 1e9) / (mapped_input * 175)),
+           log_norm = if_else(type == "ip", log10(norm + 1), log10(norm + 1) * -1))
+  
+  corr <- signif(cor(df_pair[df_pair$type == "ip", ]$norm,
+                     df_pair[df_pair$type == "input", ]$norm, 
+                     method = "spearman"), 4)
+  
+  df_pair$pair <- str_c(ip, " vs ", input, ", corr = ", corr)
+  
+  return(df_pair)
+}
+
+all_cov_in_chr1_reg <- map(libpairs, read_cov_in_chr1) %>% 
+  bind_rows() %>% 
+  filter(pos > 550000, pos < 1175000)
+saveRDS(all_cov_in_chr1_reg, str_c(wd, "R_objects/all_cov_in_chr1_reg.rds"))
+
+pdf(file = str_c(figs_path, "IP_vs_input_chr1_region.pdf"), width = 12, height = 3 * nrow(libpairs))
+ggplot(all_cov_in_chr1_reg, aes(pos, log_norm, fill = type)) + 
+  geom_bar(stat = "identity", position = "stack", color = NA) + 
+  facet_wrap(~pair, ncol = 1) + 
+  labs(x = "Genomic Coordinate", y = "Normalized Coverage (SPKM)") +
+  scale_fill_manual(values = c("snow3", "steelblue")) +
+  theme(panel.background = element_rect(fill = NA),
+        legend.position = "top", legend.title = element_blank(),
+        strip.text = element_text(face = "bold"),
+        legend.background = element_rect(fill = "white", color = "black", size = .1)) +
+  my_theme
+dev.off()
+```
+
+### **Coverage across Chromosome 1** <a name="chr1_cov"></a>
+```
+read_ssp_stats <- function(x) {
+    df <- fread(x, nrows = 6, col.names = c("stat", "value")) %>%
+      column_to_rownames("stat") %>% 
+      t() %>% as.data.frame() %>% 
+      mutate(lib = str_split(x, "/", simplify = T)[, 5])
+    
+    colnames(df) <- c("NSC", "RSC", "RLSC", "est_frag_len", "background_enrichment", "background_uniformity", "lib")
+    
+    return(df)
+}
+
+ssp_stats <- str_c(wd, dir(wd, "rep"), "/bam/ssp/ssp.jaccard.csv") %>% 
+  map(read_ssp_stats) %>% 
+  bind_rows() 
+
+saveRDS(ssp_stats, str_c(wd, "R_objects/ssp_stats.rds"))
+```
+
+```
+read_ssp <- function(x) {
+    df <- fread(x, skip = 6, col.names = c("strand_shift", "jaccard_index", "proportion", "norm_jaccard", "rel_jaccard_to_bg")) %>% 
+      mutate(lib = str_split(x, "/", simplify = T)[, 5])
+    
+    return(df)
+}
+
+ssp <- str_c(wd, dir(wd, "rep"), "/bam/ssp/ssp.jaccard.csv") %>% 
+  map(read_ssp) %>% 
+  bind_rows() %>%
+	separate(lib, c("sample", "rep", "mark"), sep = "_", remove = F) %>% 
+	unite(sample, sample, rep, sep = "_")
+
+theme_1 <- theme(axis.text = element_text(size = 15),
+        axis.title = element_text(size = 18),
+        strip.text = element_text(size = 16),
+        legend.text = element_text(size = 15),
+        panel.grid.major = element_line(linetype = "dotted", colour = "gainsboro"))
+
+pdf(file = str_c(figs_path, "first_submission/ssp_strand_profile.pdf"), width = 10)
+ggplot(ssp, aes(strand_shift, jaccard_index, col = mark)) +
+  geom_line(data = subset(ssp, strand_shift > 0 & strand_shift < 500), alpha = 0.8, size = 1) +
+  facet_wrap(~sample) +
+  labs(x = "Strand Shift", y = "Jaccard Index", col = NULL) +
+  scale_color_manual(values = c("steelblue", "snow3")) +
+  theme_1
+dev.off()
+
+ggplot(ssp, aes(strand_shift, rel_jaccard_to_bg)) +
+  geom_line(data = subset(ssp, strand_shift > 0 & strand_shift < 500 & mark == "input"), alpha = 0.8, size = 1) +
+  facet_wrap(~sample) +
+  labs(x = "Strand Shift", y = "Jaccard Index", col = NULL)
+```
+
+
+### **Peak calling** <a name="peakcall"></a>
+
+In order to identify regions of localized enrichment of aligned reads in each of our IPs, we will use Misha Bilenky's [findER](http://www.epigenomes.ca/tools-and-software/finder/index.html). We choose findER as it is designed to work with histone modification data that is localized (e.g. H3K4me3, H3K27ac) as well as dispersed (e.g. H3K27me3, H3K36me3). From previous experience, we also know that it outperforms MACS2 in its ability to call what appear to be true peaks. 
+
+Note that duplicate reads are removed during peak calling, but considered when calculating coverage ([source](http://journals.plos.org/ploscompbiol/article?id=10.1371/journal.pcbi.1003326)). findER automatically removes duplicates.
+
+Here's the Makefile code to call peaks:
+
+```
+lib_pairs = $(shell cat lib_pairs.tsv | awk '{print$$1"__"$$2}')
+
+runFinder = $(foreach lib_pair, ${lib_pairs}, $(lib_pair)/peaks.bed)
+callpeaks : ${runFinder}
+
+%/peaks.bed :
+	ip=$$(echo $* | awk '{ gsub("__.*", ""); print }'); \
+        input=$$(echo $* | awk '{ gsub(".*__", ""); print }'); \
+        ${java} -jar -Xmx20G ${finder} -signalBam \
+        ./$${ip}/bam/gsc.sorted.bam -inputBam ./$${input}/bam/gsc.sorted.bam \
+        -out ./$${ip}/peaks/; gunzip -c \
+        ./$${ip}/peaks/gsc.sorted.vs.gsc.sorted.FDR_0.05.FindER.bed.gz | \
+        awk '{gsub("chr", "");print}' | \
+        ${bedops}/sort-bed --max-mem 20G --tmpdir ./tmp - \
+        > ./$${ip}/peaks/peaks.sorted.bed; \
+        rm ./$${ip}/peaks/gsc.sorted.vs.gsc.sorted.FDR_0.05.FindER.bed.gz
+```
+
+### **Calculating raw coverage within peaks** <a name="peakcov"></a>
+
+One of our QC experiments will involve looking at the relative IP and input levels in each peak (good peaks should have high IP and low input coverage). We will also be looking at how many reads tend to contribute to each peak, as well as the proportion of total (sequenced) reads that contribute to peaks. For these reasons, we need to know the coverage of every library (including inputs) in each of their peak files. Code:
+
+```
+peakcov = $(foreach lib_pair, ${lib_pairs}, $(lib_pair)/peaks/cov_in_peaks.bed)
+peakcovs : ${peakcov}
+
+# raw coverage in peaks
+%/peaks/cov_in_peaks.bed :
+        ip=$$(echo $* | awk '{ gsub("__.*", ""); print }'); \
+        input=$$(echo $* | awk '{ gsub(".*__", ""); print }'); \
+        ${bedtools}/coverageBed -abam $${ip}/bam/gsc.bam -b \
+        $${ip}/peaks/peaks.sorted.bed -counts | \
+        ${bedops}/sort-bed --max-mem 10G --tmpdir ./tmp - > \
+        $${ip}/bam/cov_in_$${ip}_peaks.bed; \
+        ${bedtools}/coverageBed -abam $${input}/bam/gsc.bam -b \
+        $${ip}/peaks/peaks.sorted.bed -counts | \
+        ${bedops}/sort-bed --max-mem 10G --tmpdir ./tmp - > \
+        $${input}/bam/cov_in_$${ip}_peaks.bed
+```
+
+### **Calculating raw coverage around TSS regions** <a name="tsscov"></a>
+
+Another module of our QC involves looking at the average coverage of each IP library around TSS regions. Some libaries, such as H3K4me1, will have bimodal distributions around TSS regions - with a dip at the center of the TSS. Others, like H3K27ac, will have a single peak in the center. To do this, we need the coverage of each library (save inputs) around all TSS regions of the genome. We start by taking known TSS locations and *padding* them by 5 kb in both direction. We then take these padded regions and break them up into non-overlapping, equally-sized bins.
+
+Next, we just find the coverage of every library in each of these bins. Code:
+
+```
+# pad and bin TSS regions
+./tss_padbin.bed :
+        cat ${pd}/tss_pad_1500_500.bed | \
+        awk '{printf("${PERCENT}s\t${PERCENT}i\t${PERCENT}i\t${PERCENT}s\n", \
+        $$1, ($$10 - 5000), ($$10 + 5000), $$6)}' | awk '$$2 > 0' | \
+        ${bedops}/sort-bed --max-mem 20G --tmpdir ./tmp - | \
+        ${bedtools}/windowMaker -b - -w 100 -i srcwinnum | \
+        ${bedops}/sort-bed --max-mem 20G --tmpdir ./tmp - > $@
+
+# coverage of IPs in TSS bins
+tsscov = $(foreach lib_pair, ${lib_pairs}, $(lib_pair)/peaks/cov_across_tss.bed)
+tsscovs : ${tsscov}
+
+%/peaks/cov_across_tss.bed :
+        ip=$$(echo $* | awk '{ gsub("__.*", ""); print }'); \
+        ${bedtools}/coverageBed -abam ./$${ip}/bam/gsc.sorted.bam \
+        -b ./tss_padbin.bed -counts > ./$${ip}/peaks/cov_across_tss.bed
+```
+
+### **Calculating Jaccard indeces** <a name="jaccard"></a>
+
+The [Jaccard index](https://en.wikipedia.org/wiki/Jaccard_index) is a measure of the relatedness between two sets of regions. We will use it to measure the degree of similarity between all IP libraries, for a total of 5,184 comparisons. Conveniently, *bedtools* has a built-in Jaccard function. Code:
+
+```
+jac_pairs = $(shell libs=$$(cut -f 1 ./libs.tsv); for i in $$libs; \
+              do for j in $$libs; do echo $$i"__"$$j; done; done | grep -v input)
+
+jac = $(foreach jp, ${jac_pairs}, ./jaccards/$(jp).tsv)
+jacs : ${jac}
+
+./jaccards/%.tsv :
+        p1=$$(echo $* | awk '{ gsub("__.*", ""); print }'); \
+        p2=$$(echo $* | awk '{ gsub(".*__", ""); print }'); \
+        ${bedtools}/bedtools jaccard -a ./$${p1}/peaks/peaks.sorted.bed \
+        -b ./$${p2}/peaks/peaks.sorted.bed | tail -1 > $@
+```
+
+
+
+We can make a few observations from this plot:
+
+- Most libraries have a high number of (QC-passed) mapped reads. [Guidelines](http://genome.cshlp.org/content/22/9/1813.full.pdf+html) published by the ENCODE group in 2012 state that most ChIP experiments should aim for 10-20 million (1e7) uniquely mapped reads, which many of our libraries meet. Initially, NHA input (rep2) and NHA H3K27ac (rep2) libraries suffered from a very low number of mapped reads despite other libraries in the same pool yielding good sequencing metrics (see original qc tutorial). Hence, these two libraries were re-sequenced and now we have good flagstat metrics for them. 
+- All libraries have a very high (> 90%) percentage of mapped reads. Another set of [published guidelines](http://journals.plos.org/ploscompbiol/article?id=10.1371/journal.pcbi.1003326) state that mapping rates under 50% are cause for concern, and we are well above that.
+- Most libraries have consistent and low rates of duplicated reads (%) - except for NHA (replicate 2) and NHA-A2 (replicate 1) H3K9me3 libraries - which suffered from low DNA quantity prior to sequencing.
+
+To summarize, the majority of the data look great, but we will keep an eye on the following red-flagged libraries:
+
+  - NHA H3K9me3 (replicate 2)
+  - NHA-A2 H3K9me3 (replicate 1)
+
+### **Normalized coverage across Chromosome 1*]** <a name="chr1res"></a>
+
+As part of his QC pipeline, Misha Bilenky looks at IP and (matched) input coverage across broad sections of the genome. This allows the viewer to get a sense of the general distribution of the data, ie. how **peaky** the IPs are and how **uniform** their inputs are. Coverage is normalized using SPKM (signal per million mapped reads per thousand bp) which corrects for both sequencing depth (deeper libraries inherently benefit from higher coverage) and the size of the region (bigger regions will have a higher coverage due to random chance).
+
+SPKM is calculated via:
+
+```
+(raw coverage x 1e3 x 1e6) / (size of region x number of mapped reads)
+```
+
+We also calculate the Spearman correlation which measures how similar the matched IP / input pairs are in these regions. This value should not be too high, although there are not any published recommendations (values should not exceed 0.5 to deem a library to be 'good' according to Misha).
+
+```
+flagstats <- readRDS("R_objects/histone_mod_chip_flagstats.rds") %>% 
+  tidyr::unite(lib, cell_line, rep, mark, sep = "_")
+
+libpairs <- fread("lib_pairs.tsv", sep = '\t', header = F, stringsAsFactors = F) %>% 
+  tidyr::unite(libpair, V1, V2, sep = ".") %>% 
+  as.list() %>% 
+  unlist()
+
+read_cov_in_genomebins <- function(libpair) {
+  ip <- gsub("\\..*", "", libpair)
+  input <- gsub("^.*\\.", "", libpair)
+  col_names <- c("chr", "start", "end", "cov")
+  
+  cov_in_genomebins_IP <- fread(str_c(ip, "/bam/cov_in_genomebins.bed"), sep = '\t', header = F, stringsAsFactors = F, col.names = col_names) %>% 
+    mutate(type = "ip", lib = ip)
+  
+  cov_in_genomebins_input <- fread(str_c(input, "/bam/cov_in_genomebins.bed"), sep = '\t', header = F, stringsAsFactors = F, col.names = col_names) %>% 
+    mutate(type = "input", lib = input)
+  
+  cov_in_genomebins_pair <- rbind(cov_in_genomebins_IP, cov_in_genomebins_input)
+  mapped_ip <- flagstats[flagstats$lib == ip, ]$mapped
+  mapped_input <- flagstats[flagstats$lib == input, ]$mapped
+  
+  cov_in_genomebins_pair_final <- cov_in_genomebins_pair %>% 
+    mutate(pos = start + 87.5,
+           norm = if_else(type == "ip", (cov * 1e9) / (mapped_ip * 175), (cov * 1e9) / (mapped_input * 175)),
+           log_norm = if_else(type == "ip", log10(norm + 1), log10(norm + 1) * -1))
+  
+  corr <- signif(cor(cov_in_genomebins_pair_final[cov_in_genomebins_pair_final$type == "ip", ]$norm,
+                     cov_in_genomebins_pair_final[cov_in_genomebins_pair_final$type == "input", ]$norm, 
+                     method = "spearman"),4)
+  
+  cov_in_genomebins_pair_final$pair <- str_c(ip, " vs ", input, ", corr = ", corr)
+  
+  return(cov_in_genomebins_pair_final)
+}
+
+all_cov_in_genomebins <- map(libpairs, read_cov_in_genomebins) %>% 
+  bind_rows()
+saveRDS(all_cov_in_genomebins, "R_objects/all_cov_in_genomebins.rds")
+
+all_cov_in_genomebins_chr1_region <- all_cov_in_genomebins[all_cov_in_genomebins$pos > 550000 & all_cov_in_genomebins$pos < 1175000, ]
+
+pdf(file = "figures/qc/IP_vs_input_chr1_region.pdf", width = 9, height = 3 * length(libpairs))
+ggplot(all_cov_in_genomebins_chr1_region, aes(pos, log_norm, fill = type)) + 
+  geom_bar(stat = "identity", position = "stack", color = NA) + 
+  facet_wrap(~pair, ncol = 1) + 
+  labs(x = "Genomic Coordinate", y = "Normalized Coverage (SPKM)") +
+  scale_fill_manual(values = c("gray50", "#234B9F")) +
+  theme(panel.background = element_rect(fill = NA),
+        legend.position = "top", legend.title = element_blank(),
+        strip.text = element_text(face = "bold"),
+        legend.background = element_rect(fill = "white", color = "black", size = .1))
+dev.off()
+```
+
+It would take too much room to display the entire figure; you can find the link to the pdf here:
+<br><a href="/projects/marralab_cic_prj/histone_mod_chip/figures/qc/IP_vs_input_chr1_region.pdf">(Download PDF)</A></center>
+
+### **Jaccard indices between groups of peaks** <a name="jaccres"></a>
+
+```
+jac_files <- grep("jaccards/", list.files(recursive = T, full.names = T), value = T)  
+
+read_jacs <- function(file){
+  jac <- fread(file, sep = '\t', header = F, col.names = c("intersect", "union", "jaccard")) %>% 
+    mutate(pair = gsub("./jaccards/(.*).tsv", "\\1", file),
+           p1 = str_split(pair, "__")[[1]][1],
+           p2 = str_split(pair, "__")[[1]][2])
+  return(jac)
+}
+
+jacs <- map(jac_files, read_jacs) %>% bind_rows()
+
+jacs_dcast <- dcast(p1 ~ p2, data = jacs, value.var = c("jaccard")) %>% 
+  column_to_rownames("p1")
+
+jBuPuFun <- colorRampPalette(brewer.pal(n = 9, "Purples"))
+purples_pal<-jBuPuFun(12)
+
+pdf(file = "figures/qc/jaccard_heatmap.pdf", width = .8 * length(libpairs), height = .6 * length(libpairs))
+(p <- pheatmap(as.matrix(jacs), 
+         color = purples_pal[-1], 
+         border_color = "black",
+         fontsize_row = 7, 
+         fontsize_col = 7))
+save_plot(p, "figures/qc/jaccard_heatmap.png", base_width = .8 * length(libpairs), base_height = .6 * length(libpairs))
+dev.off()
+```
+<center><img src="/projects/marralab_cic_prj/histone_mod_chip/figuress/qc/jaccard_heatmap.png">
+
+From this we observe a couple things:
+
+  -  The six marks cluster with one another (ie. H3K4me1 peaks are more similar to all the other groups of H3K4me1 peaks than other marks). These are the big purple groups along the diagonal.
+  -  Marks associated with transcriptional activation / open chromatin form a separate group from repressive / closed chromatin marks. You can see this in the clustering dendrogram (top). The two main groups are (1) H3K4me1, H3K27ac and H3K4me3 and (2) H3K36me3, H3K27me3 and H3K9me3. Since H3K36me3 is not neccessarily "repressive", you could rather consider these two clustering groups to represent "promoters" and "non-promoters".
+  -  Libraries also cluster according to IDH1 status. F8's group with one another, separate of NHA.
+  
+All these things are great. Good data.
+
+### **Number of peaks** <a name="peaknum"></a>
+
+From now on, information is leveraged from the peaks called by findER. An obvious thing to look at is the number of peaks called for each mark, for each sample.
+
+```
+read_cov_in_peaks <- function(bed) {
+	cov_in_peaks <- fread(str_c(bed, "/bam/cov_in_", bed, "_peaks.bed"), sep = '\t', header = F, col.names = c("chr", "start", "end", "qval", "cov"))
+	cov_in_peaks$lib <- bed
+	
+	#as.numeric is used to prevent integer overflow while calculating spkm
+	mapped <- as.numeric(flagstats[flagstats$lib == bed, ]$mapped)
+	
+	cov_in_peaks <- cov_in_peaks %>% 
+	  filter(chr %in% c(1:22, "X", "Y")) %>% 
+	  mutate(size = end - start, spkm = (cov * 1e9) / (mapped * size)) %>% 
+		separate(lib, c("sample", "mark"), "(_)(?=[^_]+$)")
+
+	return(cov_in_peaks)
+}
+
+all_cov_in_peaks <- str_subset(dir(), "h3") %>%
+	map(read_cov_in_peaks) %>% 
+	bind_rows()
+
+all_cov_in_peaks$chr <- factor(all_cov_in_peaks$chr, levels = c(1:22, "X", "Y"))
+all_cov_in_peaks$sample <- as.factor(all_cov_in_peaks$sample)
+all_cov_in_peaks$mark <- as.factor(all_cov_in_peaks$mark)
+
+saveRDS(all_cov_in_peaks, "R_objects/all_cov_in_peaks.rds")
+all_cov_in_peaks <- readRDS("R_objects/all_cov_in_peaks.rds")
+
+all_peak_summary <- all_cov_in_peaks %>% 
+  count(sample, mark) %>% 
+  separate(sample, c("cell_line", "rep"), "_")
+
+pdf(file = "figures/qc/number_of_peaks.pdf", height = 8, width = 12)
+(p <- ggplot(all_peak_summary, aes(mark, y = n, color = cell_line, shape = rep)) + 
+  geom_jitter(width = 0.1, alpha = 0.8, size = 4) + 
+  facet_wrap(~mark, scales = "free") +
+  scale_color_manual(guide = guide_legend(override.aes = list(size = 6)), 
+                     values = c("#FF6600", "#FF9966", "#FFC69E", "#009966", "#85D9C9", "#CCFFFF")) +
+  labs(x = "", y = "# of Peaks") +
+  theme(panel.background = element_rect(fill = NA, color = "black"),
+        strip.background = element_rect(fill = "gray96",color = "black"),
+        axis.text.x = element_blank(), legend.key = element_rect(fill = NA),
+        legend.background = element_rect(fill = NA, color = "black"),
+        strip.text = element_text(size = 15, color = "black", face = "bold"),
+        panel.grid.major = element_line(color = "gray90"),
+        panel.grid.minor = element_blank(),
+        axis.title.y = element_text(size = 19, color = "black"),
+        legend.title = element_blank(), axis.ticks.x = element_blank(),
+        legend.text = element_text(size = 15, color = "black"),
+        axis.text.y = element_text(size = 14, color = "black")))
+save_plot("figures/qc/number_of_peaks.png", p, base_height = 8, base_width = 12)
+dev.off()
+```
+
+<center><img src="/projects/marralab_cic_prj/histone_mod_chip/figures/qc/number_of_peaks.png">
+
+> We can see that there is some variation in terms of the number of peaks called across the different samples. These differences may be biological meaningful / interesting, and can be explored during post-QC analysis. For our purposes right now, we can see that a reasonable number of peaks were called for each library and we are satisfied with this.
+
+### **Distribution of peaks across chromosomes** <a name="peakdist"></a>
+
+Another thing we can look at is how many peaks are located in each chromosome, to identify potential biases. Note that larger chromosomes are inherently biased toward having more peaks. We can normalize against this by calculating the number of peaks *per kb of chromosome*.
+
+```
+chr_sizes <- fread("/projects/marralab_cic_prj/shared_objects/hg19_chromsizes.tsv", header = F, sep = '\t', col.names = c("chr", "size"))
+peaks_chr_summary <- all_cov_in_peaks %>% 
+	count(sample, mark, chr) %>% 
+	left_join(chr_sizes, by = "chr") %>% 
+	mutate(n_peaks_norm = n / (size / 1e3)) %>% 
+	tidyr::unite(lib, sample, mark, sep = "_")
+
+peaks_chr_summary$chr <- factor(peaks_chr_summary$chr, levels = c(1:22, "X", "Y"))
+
+pdf(file = "figures/qc/peaks_by_chr.pdf", height = 1.5 * length(libpairs), width = 4)
+ggplot(peaks_chr_summary, aes(x = chr, y = n_peaks_norm)) + 
+  geom_bar(stat = "identity", color = "black", size = 0.8, fill = "#234B9F", alpha = 0.7) +
+  labs(x = "", y = "# of Peaks per kb of Chromosome") + 
+  facet_wrap(~ lib, scales = "free", ncol = 1) +
+  theme(legend.position = "", 
+        axis.title = element_text(size = 17, color = "black"),
+        axis.text.y = element_text(size = 8, color = "black"),
+        axis.text.x = element_text(size = 7, color = "black"),
+        panel.background = element_rect(fill = NA, color = "black"),
+        panel.grid.major = element_line(color = "gray90"),
+        panel.grid.minor = element_blank(),
+        strip.text = element_text(size = 7, color = "black", face = "bold"))
+dev.off()
+
+```
+
+Again, due to space restraints, this figure can be found as a pdf [here](/projects/marralab_cic_prj/histone_mod_chip/figures/qc/peaks_by_chr.pdf)
+For the most part, the tendency for peaks to be found on each chromosome is about the same. The consistent exception to this seems to be H3K9me3, where chromosome 19 appears to accumulate more peaks than other chromosomes.
+
+### **General peak attributes** <a name="peakatt"></a>
+
+We can also look at several peak characteristics from each IP. First, let's look at the consistency of q-values for each mark across the different samples.
+
+```
+pdf(file = "figures/qc/peak_qvals.pdf", width = 8, height = 12)
+p <- ggplot(all_cov_in_peaks, aes(mark, qval, fill = sample)) + 
+  geom_violin(alpha = 0.8, color = "black") + 
+  facet_wrap(~ mark, scales = "free", ncol = 1) +
+  labs(x = "", y = "-log10 q value") +
+  scale_fill_manual(values = rep(c("red", "blue", "green", "orange", "purple", "black"), each = 2)) +
+  theme(panel.background = element_rect(fill = NA, color = "black"),
+        panel.grid.major = element_line(color = "gray90"),
+        panel.grid.minor = element_blank(),
+        strip.background = element_rect(fill = "gray96",color = "black"),
+        strip.text = element_text(size = 15, color = "black", face = "bold"),
+        axis.title.y = element_text(size = 15, color = "black"),
+        axis.text.x = element_blank(), 
+        axis.text.y = element_text(size = 14, color = "black"),
+        axis.ticks.x = element_blank(),
+        legend.key = element_rect(fill = NA),
+        legend.background = element_rect(fill = NA, color = "black"),
+        legend.title = element_blank(), 
+        legend.text = element_text(size = 15, color = "black"))
+p
+#save_plot("figures/qc/peak_qvals.png", p, base_width = 8, base_height = 12)
+dev.off()
+```
+
+<center><img src="/projects/marralab_cic_prj/histone_mod_chip/figures/qc/qc_peak_qvals.png">
+
+> Note that, for each sample, replicate 1 is shown first followed by replicate 2. We can see that different marks have different q-value distributions. Also, there is a good consistency in these distributions across different libraries for the same mark. 
+
+Each peak is made up of a certain number of reads - which can be thought of as overall peak coverage. Next, let's investigate the distribution of coverages (normalized) for peaks in each library. 
+
+```
+pdf(file = "figures/qc/peak_cov.pdf", width = 8, height = 12)
+p <- ggplot(all_cov_in_peaks, aes(mark, y = log10(spkm + 1), fill = sample)) +
+  geom_violin(alpha = 0.8, color = "black") + 
+  facet_wrap(~ mark, scales = "free", ncol = 1) +
+  scale_fill_manual(values = rep(c("red", "blue", "green", "orange", "purple", "black"), each = 2)) +
+  labs(x = "", y = "log 10 SPKM") +
+  theme(panel.background = element_rect(fill = NA, color = "black"),
+        panel.grid.major = element_line(color = "gray90"),
+        panel.grid.minor = element_blank(),
+        strip.background = element_rect(fill = "gray96",color = "black"),
+        strip.text = element_text(size = 15, color = "black", face = "bold"),
+        axis.title.y = element_text(size = 15, color = "black"),
+        axis.text.x = element_blank(), 
+        axis.text.y = element_text(size = 14, color = "black"),
+        axis.ticks.x = element_blank(),
+        legend.key = element_rect(fill = NA),
+        legend.background = element_rect(fill = NA, color = "black"),
+        legend.title = element_blank(),
+        legend.text = element_text(size = 15, color = "black"))
+p
+save_plot("figures/qc/peak_cov.png", p, base_width = 8, base_height = 12)
+dev.off()
+```
+
+<center><img src="/projects/marralab_cic_prj/histone_mod_chip/figures/qc/qc_peak_cov.png">
+
+Things look consistent and this is good. Moving on, I next looked at the distribution of peak sizes (or breadths, ie, how many bp does each peak span) for each IP library.
+
+```
+pdf(file = "figures/qc/peak_size.pdf", width = 8, height = 12)
+p <- ggplot(all_cov_in_peaks, aes(mark, y = log10(size + 1), fill = sample)) +
+  geom_violin(alpha = 0.8, color = "black") + 
+  facet_wrap(~ mark, scales = "free", ncol = 1) +
+  scale_fill_manual(values = rep(c("red", "blue", "green", "orange", "purple", "black"), each = 2)) +
+  labs(x = "", y = "log 10 Peak Size") +
+  theme(panel.background = element_rect(fill = NA, color = "black"),
+        panel.grid.major = element_line(color = "gray90"),
+        panel.grid.minor = element_blank(),
+        strip.background = element_rect(fill = "gray96",color = "black"),
+        strip.text = element_text(size = 15, color = "black", face = "bold"),
+        axis.title.y = element_text(size = 15, color = "black"),
+        axis.text.x = element_blank(), 
+        axis.text.y = element_text(size = 14, color = "black"),
+        axis.ticks.x = element_blank(),
+        legend.key = element_rect(fill = NA),
+        legend.background = element_rect(fill = NA, color = "black"),
+        legend.title = element_blank(),
+        legend.text = element_text(size = 15, color = "black"))
+p
+save_plot("figures/qc/peak_size.png", p, base_width = 8, base_height = 12)
+dev.off()
+```
+
+<center><img src="/projects/marralab_cic_prj/histone_mod_chip/figures/qc/qc_peak_size.png">
+
+> Again, things are consistent for each mark across samples. Nothing is critically terrible / outlierish.
+
+### **Percentage of mapped reads contributing to peaks** <a name="peakcon"></a>
+
+Based on the ENCODE ChIP-seq guideline [paper](https://www.ncbi.nlm.nih.gov/pmc/articles/PMC3431496/), I also calculated the fraction of all mapped reads that fall into peak regions identified by my peak-calling algorithm. This metric will give us an idea of how noisy the data are. If the data is very clean, a high proportion of mapped reads will contribute to what we called significant peaks.
+
+
+```
+all_cov_in_peaks <- readRDS("R_objects/all_cov_in_peaks.rds")
+```
+
+# keep h3k4me1 peaks with a minimum of 600bp based on the expectation that a minimal size of 4 nucleosomes is required to show bimodal signals expected in “functional enhancers” - pellacini et al 2016
+```{r}
+filter_merged_h3k4me1 <- function(lib){
+  peaks <- fread(str_c(lib, "/peaks/peaks.sorted.merged.bed"), sep = '\t', header = F, col.names = c("chr", "start", "end")) %>% 
+    mutate(size = end - start) %>% 
+    filter(size > 600) %>% 
+    dplyr::select(-size)
+  
+  write_delim(peaks, str_c(lib, "/peaks/peaks.sorted.merged.f600.bed"), delim = "\t", col_names = F)
+}
+
+h3k4me1_merged_peaks <- str_subset(dir(), "h3k4me1") %>%
+	map(filter_merged_h3k4me1)
+```
+
+```
+samples = $(shell cat samples.tsv)
+
+setup_region :
+        mkdir regions; \
+        for sample in ${samples}; do \
+                mkdir regions/$${sample}; \
+                mkdir regions/$${sample}/enhancer; \
+                mkdir regions/$${sample}/promoter; \
+        done
+
+get_active_enhancer = $(foreach sample, ${samples}, regions/${sample}/enhancer/active_enhancer.bed)
+get_active_enhancers : ${get_active_enhancer}
+
+./regions/%/enhancer/active_enhancer.bed :
+        # first remove h3k4me1 peaks that overlap with h3k4me3 peaks
+        ${bedtools}/subtractBed -a $*_h3k4me1/peaks/peaks.sorted.merged.f600.bed -b $*_h3k4me3/peaks/peaks.sorted.bed -A \
+        > ./regions/$*/enhancer/primed_enhancer.bed; \
+
+        # keep peaks that overlap with h3k27ac peaks
+        ${bedtools}/intersectBed -a ./regions/$*/enhancer/primed_enhancer.bed -b $*_h3k27ac/peaks/peaks.sorted.bed -wa \
+        > ./regions/$*/enhancer/tmp_enhancer.bed; \
+
+        # remove peaks that overlap with h3k27me3 peaks
+        ${bedtools}/subtractBed -a ./regions/$*/enhancer/tmp_enhancer.bed -b $*_h3k27me3/peaks/peaks.sorted.bed -A > $@
+```
+
+```{r}
+write_active_enhancers <- function(lib){
+  peaks <- fread(str_c("regions/", lib, "/enhancer/active_enhancer.bed"), sep = '\t', header = F, col.names = c("chr", "start", "end")) %>% 
+    filter(chr %in% c(1:22, "X", "Y")) %>% 
+    mutate(chr = str_c("chr", chr))
+  
+  write_delim(peaks, str_c("output/", lib, "_active_enhancers.bed"), delim = "\t", col_names = F)
+}
+
+dir("regions/") %>% map(write_active_enhancers)
+
+write_delim(all_active_enhancers, "./output/all_active_enhancers.bed", delim = "\t", col_names = F)
+```
+
+# Annotate active enhancers with associated genes using GREAT
+```{r}
+refseq_mapper <- fread("../shared_objects/Homo_sapiens_hg19_refseq.bed", sep = "\t") %>% 
+  dplyr::select(gene_id = name, gene_name = name2)
+
+vista_enhancers <- fread("/projects/marralab_cic_prj/histone_mod_chip/ref_data/vista_enhancer_hg19_anno.bed", sep = '\t', header = F, 
+                         col.names = c("chr", "start", "end", "vista_id", "gene_id", "strand")) %>% 
+  left_join(refseq_mapper)
+```

@@ -1,0 +1,1910 @@
+---
+title: "CIC Project: DE Analysis on RNA-seq Data"
+author: "Stephen Lee"
+date: '`r format(Sys.time(), "%B %d, %Y")`'
+output: github_document
+---
+
+## Table of Contents
+
+----
+
+[DE Analysis in R](#main)    
+  - [Load libraries](#setup)    
+	- [Design Matrix](#colData)    
+	- [Perform DE Analysis using DESeq2](#DE)    
+	    
+[Visualization](#vis)    
+  - [MA Plots](#MA)    
+  - [Volcano Plots](#volcano)    
+  - [Boxplots of Genes of Interest](#boxplots)    
+      
+[Gene Set Enrichment Analysis using Metascape](#gsea)
+
+----
+
+## **DE Analysis in R** <a name="main"></a>
+
+----
+
+To identify the consequences of CIC loss on the transcriptome, I performed differential expression (DE) analysis using DESeq2 comparing one CIC-WT and one CIC-KO cell line (e.g. NHA vs NHA-A2) at a time. I chose to perform DE analysis on the CIC-KO cell lines separately rather than as a pooled group so that we can be more confident that DE genes identified in both analyses are truly due to the loss of CIC. 
+
+### **Resources**
+
+[Statistical analysis of RNA-Seq data](http://www.nathalievilla.org/doc/pdf/tutorial-rnaseq.pdf)
+
+[Analyzing RNA-seq data with DESeq2](https://bioconductor.org/packages/3.7/bioc/vignettes/DESeq2/inst/doc/DESeq2.html)
+
+### **load librarires**  <a name="setup"></a>
+```{r, message=FALSE, warning=FALSE}
+library(knitr)
+library(tidyverse)
+library(cowplot)
+library(data.table)
+library(DESeq2, lib.loc = "/gsc/software/linux-x86_64-centos6/R-3.3.2/lib64/R/library")
+library(matrixStats)
+library(pheatmap)
+library(RColorBrewer)
+library(ggrepel)
+library(patchwork)
+
+select <- dplyr::select
+map <- purrr::map
+
+wd <- "/projects/marralab_cic_prj/rna_seq/"
+thesis <- "/projects/sdlee_prj/sdlee_prj_results/thesis/figures/R/"
+```
+
+# flagstats
+```{r}
+flagstats <- readRDS("/projects/marralab_cic_prj/rna_seq/R_objects/RNA-seq_flagstats.rds")
+write_csv(flagstats, "/projects/sdlee_prj/sdlee_prj_results/thesis/appendices/,flagstats.csv")
+```
+
+
+### **Design Matrix** <a name="colData"></a>
+
+To use DESeq2, we must create a data frame containing the design of our experiment. The row names of this data frame must correspond to the columns of the count matrix. We also specify "WT" as the first factor level for CIC, which tells DESeq2 to use it as the reference level. 
+
+```{r}
+all_counts <- readRDS("/projects/marralab_cic_prj/rna_seq/R_objects/all_counts.rds")
+all_counts_keep <- all_counts[rowSums(all_counts) > 0, ]
+
+make_colData <- function(counts) {
+	colData <- data.frame(rep = gsub(".*_", "", colnames(counts)),
+												line = gsub("_.*", "", colnames(counts)), 
+												type = "paired-end") %>% 
+		mutate(CIC = if_else(line %in% c("NHA", "F8", "L54"), "WT", "KO"))
+	
+	rownames(colData) <- colnames(counts)
+	colData$CIC <- factor(colData$CIC, levels = c("WT", "KO"))
+	colData$rep <- factor(colData$rep, levels = unique(colData$rep))
+	
+	return(colData)
+}
+
+NHA_A2_counts_keep <- all_counts_keep[, colnames(all_counts_keep) %like% "NHA"] %>% dplyr::select(-contains("H9"))
+NHA_A2_colData <- make_colData(NHA_A2_counts_keep)
+NHA_A2_colData %>% kable()
+
+NHA_H9_counts_keep <- all_counts_keep[, colnames(all_counts_keep) %like% "NHA"] %>% dplyr::select(-contains("A2"))
+NHA_H9_colData <- make_colData(NHA_H9_counts_keep)
+
+F8_A2_counts_keep <- all_counts_keep[, colnames(all_counts_keep) %like% "F8"] %>% dplyr::select(-contains("E10"))
+F8_A2_colData <- make_colData(F8_A2_counts_keep)
+
+F8_E10_counts_keep <- all_counts_keep[, colnames(all_counts_keep) %like% "F8"] %>% dplyr::select(-contains("A2"))
+F8_E10_colData <- make_colData(F8_E10_counts_keep)
+
+L54_N4D6_counts_keep <- all_counts_keep[, colnames(all_counts_keep) %like% "L54"] %>% dplyr::select(-contains("F4"))
+L54_N4D6_colData <- make_colData(L54_N4D6_counts_keep)
+
+L54_N8F4_counts_keep <- all_counts_keep[, colnames(all_counts_keep) %like% "L54"] %>% dplyr::select(-contains("D6"))
+L54_N8F4_colData <- make_colData(L54_N8F4_counts_keep)
+```
+
+### **Perform DE analysis using DESeq2** <a name="DE"></a>
+
+Although there are still many genes with low counts, DESeq2 performs independent filtering using the mean of normalized counts as a filtering statistic. In order to minimize the loss of power from multiple testing, DESeq2 applies a count threshold that maximizes the number of DE genes identified at the specified FDR threshold (here we use a threshold of 1% or q = 0.01).
+```
+NHA_A2_dds <- DESeq(DESeqDataSetFromMatrix(countData = NHA_A2_counts_keep, colData = NHA_A2_colData, design = ~ CIC))
+NHA_A2_res <- results(NHA_A2_dds, alpha = 0.01)
+
+NHA_H9_dds <- DESeq(DESeqDataSetFromMatrix(countData = NHA_H9_counts_keep, colData = NHA_H9_colData, design = ~ CIC))
+NHA_H9_res <- results(NHA_H9_dds, alpha = 0.01)
+
+F8_A2_dds <- DESeq(DESeqDataSetFromMatrix(countData = F8_A2_counts_keep, colData = F8_A2_colData, design = ~ CIC))
+F8_A2_res <- results(F8_A2_dds, alpha = 0.01)
+
+F8_E10_dds <- DESeq(DESeqDataSetFromMatrix(countData = F8_E10_counts_keep, colData = F8_E10_colData, design = ~ CIC))
+F8_E10_res <- results(F8_E10_dds, alpha = 0.01)
+
+L54_N4D6_dds <- DESeq(DESeqDataSetFromMatrix(countData = L54_N4D6_counts_keep, colData = L54_N4D6_colData, design = ~ CIC))
+L54_N4D6_res <- results(L54_N4D6_dds, alpha = 0.01)
+
+L54_N8F4_dds <- DESeq(DESeqDataSetFromMatrix(countData = L54_N8F4_counts_keep, colData = L54_N8F4_colData, design = ~ CIC))
+L54_N8F4_res <- results(L54_N8F4_dds, alpha = 0.01)
+```
+
+```{r}
+source("https://bioconductor.org/biocLite.R")
+biocLite("biomaRt")
+
+pd <- "/projects/marralab_cic_prj/"
+gene_anno <- read.delim(str_c(pd,"shared_objects/gene_annotations.tsv"), sep = '\t', header = F, 
+												col.names = c("chromosome","ensembl_ID","biotype"), stringsAsFactors = F) %>% 
+	unique()
+
+
+library(biomaRt)
+grch37 = useMart(biomart="ENSEMBL_MART_ENSEMBL", host="grch37.ensembl.org", path="/biomart/martservice", dataset="hsapiens_gene_ensembl")
+ensembl_coord <- getBM(attributes = c('ensembl_gene_id', 'chromosome_name', 'start_position', 'end_position', 'strand', 'description'),
+      values = gene_anno$ensembl_ID, mart = grch37) %>% 
+  select(chr = chromosome_name, start = start_position, end = end_position, ensembl_ID = ensembl_gene_id, strand, description)
+
+#import files to map gene names to ensembl ID and annotate gene info
+ensembl_mapper <- read.delim(str_c(pd,"shared_objects/ensembl_mapper.tsv"), sep = '\t', header = T, stringsAsFactors = F) %>%
+  left_join(ensembl_coord) %>% 
+  mutate(chr = str_c("chr", chr), description = str_replace(description, " \\[.*\\]", "")) %>%
+  select(chr, start, end, everything()) %>% 
+  left_join(gene_anno) %>% select(-chromosome)
+
+saveRDS(ensembl_mapper, "/projects/marralab_cic_prj/rna_seq/R_objects/ensembl_mapper.rds")
+ensembl_mapper <- readRDS("/projects/marralab_cic_prj/rna_seq/R_objects/ensembl_mapper.rds")
+```
+
+
+```
+clean_res <- function(res) {
+	res_full <- data.frame(res, stringsAsFactors = F) %>%
+		rownames_to_column("ensembl_ID") %>% 
+		merge(ensembl_mapper, by = "ensembl_ID", all = T) %>%
+		merge(gene_anno, by = "ensembl_ID", all = T) %>% 
+		na.omit() %>% 
+		mutate(log10_padj = log10(padj), direction = if_else(log2FoldChange > 0, "up", "down")) %>% 
+		dplyr::select(ensembl_ID, gene_ID, chromosome, biotype, everything()) %>% 
+		arrange(padj)
+	
+	res_full$chromosome <- factor(res_full$chromosome, levels = c(1:22, "X", "Y"))
+	res_full$biotype <- as.factor(res_full$biotype)
+	
+	return(res_full)
+}
+
+NHA_A2_res_full <- clean_res(NHA_A2_res)
+saveRDS(NHA_A2_res_full, "R_objects/NHA_A2_res_full.rds")
+
+NHA_H9_res_full <- clean_res(NHA_H9_res)
+saveRDS(NHA_H9_res_full, "R_objects/NHA_H9_res_full.rds")
+
+F8_A2_res_full <- clean_res(F8_A2_res)
+saveRDS(F8_A2_res_full, "R_objects/F8_A2_res_full.rds")
+
+F8_E10_res_full <- clean_res(F8_E10_res)
+saveRDS(F8_E10_res_full, "R_objects/F8_E10_res_full.rds")
+
+L54_N4D6_res_full <- clean_res(L54_N4D6_res)
+saveRDS(L54_N4D6_res_full, "R_objects/L54_N4D6_res_full.rds")
+
+L54_N8F4_res_full <- clean_res(L54_N8F4_res)
+saveRDS(L54_N8F4_res_full, "R_objects/L54_N8F4_res_full.rds")
+```
+
+Note that I filter the DE genes identified in both CIC-KO cell lines to exclude those with discordant directionality.
+
+```{r, message=FALSE}
+library(metap)
+get_common_DE_genes <- function(df1, df2){
+  cell_line_1 <- unlist(str_split(deparse(substitute(df1)), "_"))[2]
+  cell_line_2 <- unlist(str_split(deparse(substitute(df2)), "_"))[2]
+  
+  stat_cols <- c("baseMean", "log2FoldChange", "lfcSE", "stat", "pvalue", "padj", "log10_padj", "direction")
+  
+  colnames(df1) <- c("ensembl_ID", "gene_ID", "chromosome", "biotype", str_c(stat_cols, "_1"))
+  colnames(df2) <- c("ensembl_ID", "gene_ID", "chromosome", "biotype", str_c(stat_cols, "_2"))
+  
+  CIC_DE_res <- df1 %>% 
+    left_join(df2 %>% dplyr::select(-ensembl_ID, -chromosome, -biotype), by = "gene_ID") %>% 
+    na.omit() %>% 
+    # exclude DE genes that have opposite directionality in the two CIC-KO cell lines
+    filter(direction_1 == direction_2) %>% 
+    mutate(direction = as.factor(direction_1)) %>% 
+    rowwise() %>% 
+    # a p_value of 0 are due to it being less than the smallest representable positive double-precision floating point value
+    # to avoid invalid p values in the sumlog function, add a tiny amount 
+    dplyr::select(-c(direction_1, direction_2))
+
+  return(CIC_DE_res)
+}
+
+combine_DE_genes <- function(common_res, threshold = 0.01){
+  require(metap)
+  combined_res <- common_res %>% 
+    filter(padj_1 < threshold, padj_2 < threshold) %>% 
+    mutate(baseMean = mean(baseMean_1, baseMean_2),
+           log2FoldChange = mean(log2FoldChange_1, log2FoldChange_2),
+           pvalue = mean(pvalue_1, pvalue_2),
+           padj = mean(padj_1, padj_2),
+#           pvalue = sumlog(c((pvalue_1 + 3e-324), (pvalue_2 + 3e-324)))$p,
+#           padj = sumlog(c((padj_1 + 3e-324), (padj_2+ 3e-324)))$p,
+           log10_padj = log10(padj)) %>% 
+    dplyr::select(-contains("_1"), -contains("_2")) %>% 
+    arrange(padj)
+  
+  return(combined_res)
+}
+
+get_common_DE <- function(x, y, q) {
+  df <- x %>% 
+    select(gene_ID, chromosome, log2FoldChange, padj, direction) %>% 
+    inner_join(y %>% select(gene_ID, chromosome, log2FoldChange, padj, direction), by = "gene_ID") %>% 
+    filter(direction.x == direction.y,
+           padj.x <= q, padj.y <= q) %>% 
+    select(everything(), direction = direction.x, -direction.y) %>% 
+    rowwise() %>% 
+    mutate(mean_log2_fc = mean(c(log2FoldChange.x, log2FoldChange.y)),
+           mean_padj = mean(c(padj.x, padj.y)),
+           mean_log10_padj = log10(mean_padj))
+  
+  return(df)
+}
+
+NHA_A2_res_full <- readRDS("/projects/marralab_cic_prj/rna_seq/R_objects/NHA_A2_res_full.rds")
+NHA_H9_res_full <- readRDS("/projects/marralab_cic_prj/rna_seq/R_objects/NHA_H9_res_full.rds")
+
+NHA_A2_res_full_0.01 <- NHA_A2_res_full %>% 
+  filter(padj <= 0.01)
+
+NHA_H9_res_full_0.01 <- NHA_H9_res_full %>% 
+  filter(padj <= 0.01)
+
+NHA_CIC_DE_common_res <- get_common_DE_genes(NHA_A2_res_full, NHA_H9_res_full)
+NHA_CIC_DE_common_res_combined <- combine_DE_genes(NHA_CIC_DE_common_res, threshold = 1)
+NHA_CIC_DE_common_res_q0.01 <- combine_DE_genes(NHA_CIC_DE_common_res)
+saveRDS(NHA_CIC_DE_common_res_q0.01, "/projects/marralab_cic_prj/rna_seq/R_objects/NHA_CIC_DE_common_res_q0.01.rds")
+NHA_CIC_DE_common_res <- readRDS("/projects/marralab_cic_prj/rna_seq/R_objects/NHA_CIC_DE_common_res_q0.01.rds")
+```
+
+###-- THESIS --###
+
+```{r}
+wd <- "/projects/sdlee_prj/sdlee_prj_results/thesis/"
+
+NHA_A2_res_full <- readRDS("/projects/marralab_cic_prj/rna_seq/R_objects/NHA_A2_res_full.rds") %>% 
+  mutate(fc = if_else(direction == "down", 2^(-log2FoldChange) * -1, 2^(log2FoldChange)))
+NHA_H9_res_full <- readRDS("/projects/marralab_cic_prj/rna_seq/R_objects/NHA_H9_res_full.rds") %>% 
+  mutate(fc = if_else(direction == "down", 2^(-log2FoldChange) * -1, 2^(log2FoldChange)))
+
+# Significantly DE genes: adj. p < 0.05
+NHA_A2_q0.05 <- NHA_A2_res_full %>% 
+  filter(padj <= 0.05)
+NHA_H9_q0.05 <- NHA_H9_res_full %>% 
+  filter(padj <= 0.05)
+
+NHA_q0.05 <- NHA_A2_q0.05 %>% 
+  select(gene_ID, chromosome, padj, fc, direction) %>% 
+  inner_join(NHA_H9_q0.05 %>% select(gene_ID, chromosome, padj, fc, direction), by = "gene_ID") %>% 
+  filter(direction.x == direction.y) %>% 
+  select(chr = chromosome.x, direction = direction.x, everything(), -c("chromosome.y", "direction.y"))
+saveRDS(NHA_q0.05, str_c(wd, "data/R_objects/NHA_q0.05.rds"))
+
+write_csv(NHA_q0.05 %>% filter(direction == "up") %>% select(gene_ID, everything()), str_c(wd, "data/metascape/NHA_q0.05_up.csv"))
+write_csv(NHA_q0.05 %>% filter(direction == "down") %>% select(gene_ID, everything()), str_c(wd, "data/metascape/NHA_q0.05_down.csv"))
+
+# Significantly DE genes: adj. p < 0.05, |Fold Change| >= 1.5
+NHA_A2_q0.05_fc <- NHA_A2_res_full %>% 
+  filter(padj <= 0.05, abs(fc) >= 1.5)
+NHA_H9_q0.05_fc <- NHA_H9_res_full %>% 
+  filter(padj <= 0.05, abs(fc) >= 1.5)
+
+# concordantly DE genes: significantly DE with consistent direction in both CIC-KO cell lines
+NHA_q0.05_fc <- NHA_A2_q0.05_fc %>% 
+  select(gene_ID, chromosome, padj, fc, direction) %>% 
+  inner_join(NHA_H9_q0.05_fc %>% select(gene_ID, chromosome, padj, fc, direction), by = "gene_ID") %>% 
+  filter(direction.x == direction.y) %>% 
+  select(chr = chromosome.x, direction = direction.x, everything(), -c("chromosome.y", "direction.y"))
+saveRDS(NHA_q0.05_fc, str_c(wd, "data/R_objects/NHA_q0.05_fc.rds"))
+
+write_csv(NHA_q0.05_fc %>% filter(direction == "up") %>% select(gene_ID, everything()), str_c(wd, "data/metascape/NHA_q0.05_fc_up.csv"))
+write_csv(NHA_q0.05_fc %>% filter(direction == "down") %>% select(gene_ID, everything()), str_c(wd, "data/metascape/NHA_q0.05_fc_down.csv"))
+
+
+F8_A2_res_full <- readRDS("/projects/marralab_cic_prj/rna_seq/R_objects/F8_A2_res_full.rds") %>% 
+  mutate(fc = if_else(direction == "down", 2^(-log2FoldChange) * -1, 2^(log2FoldChange)))
+F8_E10_res_full <- readRDS("/projects/marralab_cic_prj/rna_seq/R_objects/F8_E10_res_full.rds") %>% 
+  mutate(fc = if_else(direction == "down", 2^(-log2FoldChange) * -1, 2^(log2FoldChange)))
+
+F8_A2_q0.05 <- F8_A2_res_full %>% 
+  filter(padj <= 0.05)
+
+a <- F8_A2_q0.05 %>% left_join(ensembl_mapper_type)
+
+F8_E10_q0.05 <- F8_E10_res_full %>% 
+  filter(padj <= 0.05)
+
+F8_q0.05 <- F8_A2_q0.05 %>% 
+  select(gene_ID, chromosome, padj, fc, direction) %>% 
+  inner_join(F8_E10_q0.05 %>% select(gene_ID, chromosome, padj, fc, direction), by = "gene_ID") %>% 
+  filter(direction.x == direction.y) %>% 
+  select(chr = chromosome.x, direction = direction.x, everything(), -c("chromosome.y", "direction.y"))
+saveRDS(F8_q0.05, str_c(wd, "data/R_objects/F8_q0.05.rds"))
+
+write_csv(F8_q0.05 %>% filter(direction == "up") %>% select(gene_ID, everything()), str_c(wd, "data/metascape/F8_q0.05_up.csv"))
+write_csv(F8_q0.05 %>% filter(direction == "down") %>% select(gene_ID, everything()), str_c(wd, "data/metascape/F8_q0.05_down.csv"))
+
+F8_A2_q0.05_fc <- F8_A2_res_full %>% 
+  filter(padj <= 0.05, abs(fc) >= 1.5)
+F8_E10_q0.05_fc <- F8_E10_res_full %>% 
+  filter(padj <= 0.05, abs(fc) >= 1.5)
+
+F8_q0.05_fc <- F8_A2_q0.05_fc %>% 
+  select(gene_ID, chromosome, padj, fc, direction) %>% 
+  inner_join(F8_E10_q0.05_fc %>% select(gene_ID, chromosome, padj, fc, direction), by = "gene_ID") %>% 
+  filter(direction.x == direction.y) %>% 
+  select(chr = chromosome.x, direction = direction.x, everything(), -c("chromosome.y", "direction.y"))
+saveRDS(F8_DE_q0.05_fc1.5, str_c(wd, "data/R_objects/F8__q0.05_fc.rds"))
+
+write_csv(F8_q0.05_fc %>% filter(direction == "up") %>% select(gene_ID, everything()), str_c(wd, "data/metascape/F8_q0.05_fc_up.csv"))
+write_csv(F8_q0.05_fc %>% filter(direction == "down") %>% select(gene_ID, everything()), str_c(wd, "data/metascape/F8_q0.05_fc_down.csv"))
+
+NHA_cnv_genes <- readRDS("/projects/sdlee_prj/sdlee_prj_results/thesis/data/R_objects/NHA_cnv_genes.rds")
+
+NHA_CIC_res_full_nocnv <- NHA_CIC_res_full %>% 
+  filter(!(gene_ID %in% NHA_cnv_genes$gene_ID))
+
+NHA_DE_q0.05_fc1.5_nocnv <- NHA_DE_q0.05_fc1.5 %>% 
+  filter(!(gene_ID %in% NHA_cnv_genes$gene_ID))
+
+write_csv(NHA_DE_q0.05_fc1.5_nocnv %>% filter(direction == "up"), str_c(wd, "data/metascape/NHA_DE_q0.05_fc1.5_up_nocnv.csv"))
+write_csv(NHA_DE_q0.05_fc1.5_nocnv %>% filter(direction == "down"), str_c(wd, "data/metascape/NHA_DE__q0.05_fc1.5_down_nocnv.csv"))
+
+write_csv(NHA_CIC_res_full_q0.01 %>% filter(mean_fc > 1.5, !(gene_ID %in% NHA_cnv_genes$gene_ID)), str_c(wd, "data/metascape/NHA_DE_up_nocnv.csv"))
+write_csv(NHA_CIC_res_full_q0.01 %>% filter(mean_fc < -1.5, !(gene_ID %in% NHA_cnv_genes$gene_ID)), str_c(wd, "data/metascape/NHA_DE_down_nocnv.csv"))
+#---
+
+volcano <- NHA + F8
+ggsave(str_c(thesis, "volcano_plots.png"), height = 4, dpi = 600)
+
+# volcano plots
+volcano_plot2 <- function(x, q_value) {
+  min_q <- min(x$log10_padj[which(x$log10_padj > -Inf)])
+  df <- x %>% mutate(log10_padj = if_else(log10_padj == -Inf, min_q, log10_padj))
+
+	p <- ggplot(df, aes(log2FoldChange, -log10_padj)) +
+		geom_point(data = subset(df, padj >= q_value | abs(fc <= 1.5)), size = 1.5, col = "grey", alpha = 0.5) +
+		geom_point(data = subset(df, padj < q_value & fc > 0), size = 1.5, col = "tomato", alpha = 0.7) +
+		geom_point(data = subset(df, padj < q_value & fc < 0), size = 1.5, col = "seagreen3", alpha = 0.7) +
+		geom_hline(yintercept = -log10(q_value), linetype = "dotted") +
+		labs(x = "Log2 Fold Change", y = "-Log10 Adjusted P-Value") +
+		theme(legend.position = "none",
+					axis.title = element_text(size = 15, face = "bold"),
+					axis.text = element_text(size = 14),
+					panel.grid.major = element_blank(), 
+					panel.grid.minor = element_blank(),
+          panel.background = element_blank(),
+					axis.line = element_line(colour = "black"))
+	
+	return(p)
+}
+
+NHAA2 <- volcano_plot2(NHA_A2_res_full, 0.05) + xlim(-10, 10) + ylim(0, 250) + theme(plot.margin = margin(1, 1, 1, 1, "cm"))
+NHAH9 <- volcano_plot2(NHA_H9_res_full, 0.05) + xlim(-10, 10) + ylim(0, 250) + theme(plot.margin = margin(1, 1, 1, 1, "cm"))
+
+library(patchwork)
+
+pdf(file = str_c(thesis, "NHA_volcanoes.pdf"), height = 4, width = 8)
+NHAA2 + (NHAH9 + labs(y = NULL))
+dev.off()
+
+ggsave(str_c(thesis, 'NHA_volcano.png'), dpi = 600, height = 3.5, width = 8)
+
+F8_A2_res_full <- F8_A2_res_full %>% mutate(fc = if_else(direction == "up", 2^log2FoldChange, 2^(-log2FoldChange) * -1))
+F8_E10_res_full <- F8_E10_res_full %>% mutate(fc = if_else(direction == "up", 2^log2FoldChange, 2^(-log2FoldChange) * -1))
+
+F8A2 <- volcano_plot2(F8_A2_res_full, 0.05) + xlim(-10, 10) + ylim(0, 250) + theme(plot.margin = margin(1, 1, 1, 1, "cm"))
+F8E10 <- volcano_plot2(F8_E10_res_full, 0.05) + xlim(-10, 10) + ylim(0, 250) + theme(plot.margin = margin(1, 1, 1, 1, "cm"))
+
+pdf(file = str_c(thesis, "F8_volcanoes.pdf"), height = 4, width = 8)
+F8A2 + (F8E10 + labs(y = NULL))
+dev.off()
+
+ggsave(str_c(thesis, 'F8_volcano.png'), dpi = 600, height = 3.5, width = 8)
+#---
+```
+
+Does the greater degree of transcriptional dysregulation in IDH1-WT cells reflect the consequences of chromosomal defects observed in these CIC-KO cell lines?
+
+```{r}
+# import copy number alterations from NHA single cell genome data (obtained by Veronique)
+# 500kb bins were assigned a copy number state relative to the overall ploidy of a cell
+vl_sc_cnv_NHA <- readRDS("/projects/marralab_cic_prj/shared_objects/nha_wt_gscores_segs.rds")
+
+get_genes_in_granges <- function(x) {
+  gr <- subsetByOverlaps(genes(TxDb.Hsapiens.UCSC.hg19.knownGene), x)
+  ids <- findOverlaps(genes(TxDb.Hsapiens.UCSC.hg19.knownGene), x)
+  
+  mean_g <- DataFrame(mean_g = x@elementMetadata$mean_g[subjectHits(ids)])
+  
+  mcols(gr) <- c(mcols(gr), mean_g)
+  
+  gene_mapper <- as.data.frame(org.Hs.egSYMBOL)
+  
+  df <- gr %>% 
+    as.data.frame() %>% 
+    left_join(gene_mapper) %>% 
+    select(gene_ID = symbol, mean_g) %>% 
+    unique()
+
+  return(df)    
+}
+  
+NHAA2_gain <- vl_sc_cnv_NHA$A2$gain_unique %>% makeGRangesFromDataFrame(keep.extra.columns = T)
+NHAA2_loss <- vl_sc_cnv_NHA$A2$loss_unique %>% makeGRangesFromDataFrame(keep.extra.columns = T)
+NHAH9_gain <- vl_sc_cnv_NHA$H9$gain_unique %>% makeGRangesFromDataFrame(keep.extra.columns = T)
+NHAH9_loss <- vl_sc_cnv_NHA$H9$loss_unique %>% makeGRangesFromDataFrame(keep.extra.columns = T)
+
+NHAA2_gain_genes <- get_genes_in_granges(NHAA2_gain)
+NHAA2_loss_genes <- get_genes_in_granges(NHAA2_loss)
+NHAH9_gain_genes <- get_genes_in_granges(NHAH9_gain)
+NHAH9_loss_genes <- get_genes_in_granges(NHAH9_loss)
+
+NHA_gain_genes <- rbind(NHAA2_gain_genes, NHAH9_gain_genes)
+NHA_loss_genes <- rbind(NHAA2_loss_genes, NHAH9_loss_genes)
+
+NHAA2_cnv_genes <- rbind(NHAA2_gain_genes, NHAA2_loss_genes)
+NHAH9_cnv_genes <- rbind(NHAH9_gain_genes, NHAH9_loss_genes)
+
+# all genes associated with CNV in NHA
+NHA_cnv_genes <- rbind(NHAA2_cnv_genes, NHAH9_cnv_genes) %>% select(gene_ID) %>% unique()
+
+NHA_cna_genes <- NHA_gain_genes %>% 
+  select(gene_ID = symbol) %>% 
+  mutate(status = "amplified") %>% 
+  rbind(NHA_loss_genes %>% select(gene_ID = symbol) %>% mutate(status = "deleted"))
+saveRDS(NHA_cna_genes, "/projects/marralab_cic_prj/rna_seq/R_objects/NHA_cna_genes.rds")
+
+NHA_A2_q0.05_cnv <- NHA_A2_q0.05 %>% 
+  left_join(NHAA2_cnv_genes) %>% 
+  mutate(cnv = case_when(mean_g > 0 ~ "amplified",
+                         mean_g < 0 ~ "deleted"))
+
+NHA_H9_q0.05_cnv <- NHA_H9_q0.05 %>% 
+  left_join(NHAH9_cnv_genes) %>% 
+  mutate(cnv = case_when(mean_g > 0 ~ "amplified",
+                         mean_g < 0 ~ "deleted"))
+
+a <- NHA_A2_q0.05_fc_cnv %>% group_by(direction, cnv) %>% summarize(n = n()) %>% na.omit()
+b <- NHA_H9_q0.05_fc_cnv %>% group_by(direction, cnv) %>% summarize(n = n()) %>% na.omit()
+
+# How many DE + cnv genes are common between NHAA2 and NHAH9
+a <- NHA_A2_q0.05_fc_cnv %>% filter(!isNA(mean_g))
+b <- NHA_H9_q0.05_fc_cnv %>% filter(!isNA(mean_g))
+c <- c(a$gene_ID, b$gene_ID)
+sum(a$gene_ID %in% b$gene_ID)
+
+NHA_q0.05_fc_cnv <- NHA_q0.05_fc %>% 
+  left_join(NHAH9_cnv_genes) %>% 
+  mutate(cnv = case_when(mean_g > 0 ~ "amplified",
+                         mean_g < 0 ~ "deleted"))
+
+NHA_cnv_genes <- rbind(NHAA2_res_full_cnv %>% filter(!isNA(mean_g)),
+                       NHAH9_res_full_cnv %>% filter(!isNA(mean_g))) #%>% 
+  select(gene_ID) %>% unique()
+
+NHA_q0.05_fc_cnv_genes <- rbind(NHAA2_res_full_cnv %>% filter(!isNA(mean_g)),
+                       NHAH9_res_full_cnv %>% filter(!isNA(mean_g))) %>% 
+  select(gene_ID) %>% unique()
+
+# Display copy number altered gene on volcano plot, coloured by mean GISTIC score (metric for degree of copy number alteration)
+ggplot(NHAA2_res_full_cnv, aes(log2FoldChange, -log10_padj)) +
+		geom_point(data = subset(NHAA2_res_full_cnv, isNA(mean_g)), size = 1.5, col = "grey", alpha = 0.5) +
+    geom_point(data = subset(NHAA2_res_full_cnv, !isNA(mean_g)), aes(col = mean_g), size = 1.5) +
+    geom_vline(xintercept = log2(1.5), linetype = "dotted") +
+		geom_vline(xintercept = log2(1.5) * -1, linetype = "dotted") +
+		geom_hline(yintercept = -log10(0.05), linetype = "dotted") +
+  scale_color_gradient2(low = "midnightblue", mid = "white", high = "firebrick", 
+                        limits = c(min(NHAA2_res_full_cnv$mean_g, na.rm = T), max(NHAA2_res_full_cnv$mean_g, na.rm = T))) +
+		labs(x = "Log2 Fold Change", y = "-Log10 Adjusted P-Value") +
+		theme(axis.title = element_text(size = 15, face = "bold"),
+					axis.text = element_text(size = 14),
+					panel.grid.major = element_blank(), 
+					panel.grid.minor = element_blank(),
+          panel.background = element_blank(),
+					axis.line = element_line(colour = "black"))
+
+ggplot(NHAH9_res_full_cnv, aes(log2FoldChange, -log10_padj)) +
+		geom_point(data = subset(NHAH9_res_full_cnv, isNA(mean_g)), size = 1.5, col = "grey", alpha = 0.5) +
+    geom_point(data = subset(NHAH9_res_full_cnv, !isNA(mean_g)), aes(col = mean_g), size = 1.5) +
+    geom_vline(xintercept = log2(1.5), linetype = "dotted") +
+		geom_vline(xintercept = log2(1.5) * -1, linetype = "dotted") +
+		geom_hline(yintercept = -log10(0.05), linetype = "dotted") +
+  scale_color_gradient(low = "royalblue3", high = "firebrick") +
+		labs(x = "Log2 Fold Change", y = "-Log10 Adjusted P-Value") +
+		theme(axis.title = element_text(size = 15, face = "bold"),
+					axis.text = element_text(size = 14),
+					panel.grid.major = element_blank(), 
+					panel.grid.minor = element_blank(),
+          panel.background = element_blank(),
+					axis.line = element_line(colour = "black"))
+
+NHA_cnv_unique <- rbind(NHAA2_res_full_cnv %>% filter(padj < 0.05, abs(fc) >= 1.5, !isNA(mean_g)) %>% select(gene_ID),
+                        NHAH9_res_full_cnv %>% filter(padj < 0.05, abs(fc) >= 1.5, !isNA(mean_g)) %>% select(gene_ID)) %>% unique()
+```
+
+```{r}
+# thesis: overlap between NHA and F8
+NHA_CIC_res_full_q0.01_up <- NHA_CIC_res_full_q0.01 %>% 
+  filter(direction == "up")
+NHA_CIC_res_full_q0.01_down <- NHA_CIC_res_full_q0.01 %>% 
+  filter(direction == "down")
+
+F8_CIC_res_full_q0.01_up <- F8_CIC_res_full_q0.01 %>% 
+  filter(direction == "up")
+F8_CIC_res_full_q0.01_down <- F8_CIC_res_full_q0.01 %>% 
+  filter(direction == "down")
+
+
+NHA_CIC_res_full_nocnv
+
+# genes concordantly DE in both NHA and F8
+CIC_res_full_nocnv <- NHA_CIC_res_full_q0.01 %>%
+  filter(abs(mean_fc) >= 1.5) %>% 
+  inner_join(F8_CIC_res_full_q0.01 %>% filter(abs(mean_fc) >= 1.5), by = "gene_ID") %>% 
+  filter(direction.x == direction.y)
+
+CIC_DE_summary <- NHA_DE_q0.05_fc1.5 %>%
+  inner_join(F8_DE_q0.05_fc1.5, by = "gene_ID") %>% 
+  filter(direction.x == direction.y)
+
+concordant_DE_summary <- data.frame(model = rep(c("IDH1-WT", "IDH1-R132H", "IDH1-WT & IDH1_R132H"), each = 2),
+                                    direction = rep(c("up", "down"), 3),
+                                    n_genes = c(nrow(NHA_DE_q0.05_fc1.5 %>% filter(direction == "up")),
+                                                nrow(NHA_DE_q0.05_fc1.5 %>% filter(direction == "down")),
+                                                nrow(F8_DE_q0.05_fc1.5 %>% filter(direction == "up")),
+                                                nrow(F8_DE_q0.05_fc1.5 %>% filter(direction == "down")),
+                                                nrow(CIC_DE_summary %>% filter(direction.x == "up")),
+                                                nrow(CIC_DE_summary %>% filter(direction.x == "down"))))
+
+concordant_DE_summary <- concordant_DE_summary %>% mutate(model = factor(model, levels = c("IDH1-WT", "IDH1-R132H", "IDH1-WT & IDH1_R132H")))
+concordant_DE_summary <- concordant_DE_summary %>% 
+  group_by(model) %>% 
+  mutate(prop = n_genes / sum(n_genes), 
+         n_prop = str_c(n_genes, "(", round(prop*100, digits = 1), "%)"))
+
+  
+library(scales)
+pdf(file = str_c(thesis, "concordant_summary.pdf"), width = 8, height = 4)
+ggplot(concordant_DE_summary, aes(model, n_genes, fill = direction, label = n_prop)) +
+  geom_col(position = "dodge") +
+  geom_text(position = position_dodge(width = 1), vjust = -0.5, size = 5) +
+  scale_fill_manual(values = c("seagreen3", "tomato")) +
+  scale_x_discrete(labels = c("IDH1-WT", "IDH1-R132H", "IDH1-WT &\nIDH1_R132H")) +
+  labs(x = NULL, y = "# concordantly DE genes \n (CIC-KO vs. WT)") +
+  ylim(0, 1100) +
+  my_theme +
+  theme(legend.position = "none",
+        panel.grid.major.y = element_line(linetype = "dashed", color = "gainsboro"),
+        axis.title.y = element_text(size = 18),
+        axis.text.x = element_text(size = 16, face = "bold"))
+dev.off()
+``` 
+
+```{r}
+NHA_A2_res_full_cnv <- NHA_A2_res_full %>% 
+  mutate(cnv = case_when(gene_ID %in% NHA_cnv_genes$gene_ID[NHA_cnv_genes$cell_line == "A2" & NHA_cnv_genes$status == "gain"] ~ "gain",
+                         gene_ID %in% NHA_cnv_genes$gene_ID[NHA_cnv_genes$cell_line == "A2" & NHA_cnv_genes$status == "loss"] ~ "loss",
+                         !(gene_ID %in% NHA_cnv_genes$gene_ID[NHA_cnv_genes$cell_line == "A2"]) ~ "neutral"))
+
+NHA_H9_res_full_cnv <- NHA_H9_res_full %>% 
+  mutate(cnv = case_when(gene_ID %in% NHA_cnv_genes$gene_ID[NHA_cnv_genes$cell_line == "H9" & NHA_cnv_genes$status == "gain"] ~ "gain",
+                         gene_ID %in% NHA_cnv_genes$gene_ID[NHA_cnv_genes$cell_line == "H9" & NHA_cnv_genes$status == "loss"] ~ "loss",
+                         !(gene_ID %in% NHA_cnv_genes$gene_ID[NHA_cnv_genes$cell_line == "H9"]) ~ "neutral"))
+
+NHA_res_full_cnv <- rbind(NHA_A2_res_full_cnv %>% filter(abs(fc) >= 1.5, padj < 0.05) %>% select(gene_ID, direction, cnv) %>% mutate(line = "NHAA2"),
+                          NHA_H9_res_full_cnv %>% filter(abs(fc) >= 1.5, padj < 0.05) %>% select(gene_ID, direction, cnv)%>% mutate(line = "NHAH9")) #%>% 
+  group_by(line, direction, cnv) %>% 
+  mutate(n_prop = n())
+  
+NHA_A2_q0.05_cnv <- NHA_A2_q0.05 %>% 
+  left_join(NHA_)
+  mutate(cnv = case_when(gene_ID %in% NHA_cnv_genes$gene_ID[NHA_cnv_genes$cell_line == "A2" & NHA_cnv_genes$cnv == "gain"] ~ "gain",
+                         gene_ID %in% NHA_cnv_genes$gene_ID[NHA_cnv_genes$cell_line == "A2" & NHA_cnv_genes$cnv == "loss"] ~ "loss",
+                         !(gene_ID %in% NHA_cnv_genes$gene_ID[NHA_cnv_genes$cell_line == "A2"]) ~ "neutral"))
+
+NHA_H9_res_full_cnv <- NHA_H9_res_full %>% 
+  mutate(cnv = case_when(gene_ID %in% NHA_cnv_genes$gene_ID[NHA_cnv_genes$cell_line == "H9" & NHA_cnv_genes$status == "gain"] ~ "gain",
+                         gene_ID %in% NHA_cnv_genes$gene_ID[NHA_cnv_genes$cell_line == "H9" & NHA_cnv_genes$status == "loss"] ~ "loss",
+                         !(gene_ID %in% NHA_cnv_genes$gene_ID[NHA_cnv_genes$cell_line == "H9"]) ~ "neutral"))
+  
+NHA_DE_q0.05_cnv <- rbind(NHA_A2_q0.05_cnv %>% mutate(line = "NHA-A2") %>% select(direction, cnv, line),
+                          NHA_H9_q0.05_cnv %>% mutate(line = "NHA-H9") %>% select(direction, cnv, line)) %>% 
+  mutate(cnv = if_else(isNA(cnv), "neutral", cnv)) %>% 
+  group_by(line, direction, cnv) %>% 
+  mutate(n_prop = n())
+
+a <- NHA_A2_q0.05_cnv %>% filter(!isNA(cnv))
+b <- NHA_H9_q0.05_cnv %>% filter(!isNA(cnv))
+
+nrow(NHA_cnv_genes %>% filter(gene_ID %in% NHA_q0.05$gene_ID) %>% select(gene_ID) %>% unique())
+nrow(NHA_cnv_genes %>% filter(gene_ID %in% F8_q0.05$gene_ID) %>% select(gene_ID) %>% unique())
+
+pdf(file = str_c(thesis, "NHA DE and CNV status.pdf"), width = 7, height = 5)
+ggplot(NHA_res_full_cnv, aes(direction, fill = as.factor(cnv))) +
+  geom_bar(width = 0.7) +
+  facet_wrap(~line) +
+  scale_fill_manual(values = c("firebrick", "royalblue4", "gray")) +
+  labs(x = "Direction of DE (CIC-KO vs CIC-WT)", y = "# genes", fill = "Copy number status:") +
+  ylim(0, 2400) +
+  my_theme +
+  theme(legend.position = "bottom",
+        legend.text = element_text(size = 14),
+        strip.background = element_rect(fill = "white", color = "white"),
+        strip.text = element_text(colour = "black", face = "bold", size = 18))
+dev.off()
+
+pdf(file = str_c(thesis, "NHA DE (q<0.05) and CNV status.pdf"), width = 7, height = 5)
+ggplot(NHA_DE_q0.05_cnv, aes(as.factor(direction), fill = as.factor(cnv))) +
+  geom_bar(width = 0.7) +
+  facet_wrap(~line) +
+  scale_fill_manual(values = c("firebrick", "royalblue4", "gray")) +
+  labs(x = "Direction of DE (CIC-KO vs CIC-WT)", y = "# genes", fill = "Copy number status:") +
+  my_theme +
+  theme(legend.position = "bottom",
+        legend.text = element_text(size = 14),
+        strip.background = element_rect(fill = "white", color = "white"),
+        strip.text = element_text(colour = "black", face = "bold", size = 18))
+dev.off())
+
+
+cnv_genes <- NHA_res_full_cnv %>% filter(cnv != "neutral") %>% select(gene_ID) %>% unique()
+```
+
+```
+L54_N4D6_res_full <- readRDS(str_c(wd, "R_objects/L54_N4D6_res_full.rds"))
+L54_N8F4_res_full <- readRDS(str_c(wd, "R_objects/L54_N8F4_res_full.rds"))
+
+L54_CIC_DE_common_res <- get_common_DE_genes(L54_N4D6_res_full, L54_N8F4_res_full)
+L54_CIC_DE_common_res_combined <- combine_DE_genes(L54_CIC_DE_common_res, threshold = 1)
+L54_CIC_DE_common_res_q0.01 <- combine_DE_genes(L54_CIC_DE_common_res)
+saveRDS(L54_CIC_DE_common_res_q0.01, "/projects/marralab_cic_prj/rna_seq/R_objects/L54_CIC_DE_common_res_q0.01.rds")
+L54_CIC_DE_common_res_q0.01 <- readRDS("/projects/marralab_cic_prj/rna_seq/R_objects/L54_CIC_DE_common_res_q0.01.rds")
+
+CIC_DE_summary <- data.frame(cell_line = c("NHA", "F8", "L54"),
+                             down = c(nrow(NHA_CIC_DE_common_res_q0.01 %>% filter(direction == "down")),  
+                                      nrow(F8_CIC_DE_common_res_q0.01 %>% filter(direction == "down")),
+                                      nrow(L54_CIC_DE_common_res_q0.01 %>% filter(direction == "down"))),
+                             up = c(nrow(NHA_CIC_DE_common_res_q0.01 %>% filter(direction == "up")), 
+                                    nrow(F8_CIC_DE_common_res_q0.01 %>% filter(direction == "up")),
+                                    nrow(L54_CIC_DE_common_res_q0.01 %>% filter(direction == "up")))) %>% 
+                  rowwise() %>% 
+                  mutate(total = sum(down, up)) %>% 
+                  kable()
+```
+
+## **Visualization** <a name="vis"></a>
+
+----
+
+To obtain a broad overview on the patterns of transcriptional changes due to CIC loss, we can visualize the DE analysis results using MA plots. In these plots, the mean expression of each gene is plotted on the X-axis and the log2 fold change (CIC-KO with respect to CIC-WT) on the Y-axis. Significantly upregulated and downregulated genes in CIC-KO cells are coloured red and green, respectively. To ensure that our data and analysis are valid, I label genes that were previously shown to have enrichment of CIC binding at their promoters by CIC ChIP-qPCR (LeBlanc et al, 2017). Since we know that CIC is a transcriptional repressor, we would expect that these positive CIC target genes are upregulated in CIC-KO cells.
+
+### **MA Plots** <a name="MA"></a>
+
+```{r, fig.align='center'}
+#Here we use these genes as 'positive' CIC targets (confirmed to have CIC enrichment in their promoters by CIC ChIP-qPCR)
+pos_genes <- c("DUSP4", "ETV1", "ETV4", "ETV5", "GPR3", "SHC3", "SHC4", "SPRY4")
+
+MA_plot <- function(df) {
+	p <- ggplot(df, aes(baseMean, log2FoldChange, label = gene_ID)) + 
+		geom_point(data = subset(df, padj >= 0.01), size = 1, col = "grey") +
+		geom_point(data = subset(df, padj < 0.01 & log2FoldChange > 0), size = 1, col = "#F95445") +
+		geom_point(data = subset(df, padj < 0.01 & log2FoldChange < 0), size = 1, col = "#6FD865") +
+		geom_point(data = subset(df, gene_ID %in% pos_genes), size = 2, alpha = 0.8) +
+		geom_text_repel(data = subset(df, gene_ID %in% pos_genes), aes(label = gene_ID), 
+										size = 4, fontface = "bold", arrow = arrow(length = unit(0.02, "npc"))) +
+		geom_hline(yintercept = 0, linetype = "dotted") +
+		labs(x = "Mean of Normalized Counts", y = "Log2 Fold Change") +
+		scale_x_log10() +
+		theme(axis.title = element_text(size = 11, face = "bold"),
+					axis.text = element_text(size = 10))
+	
+	return(p)
+}
+
+#plot_grid(MA_plot(NHA_A2_res_full), MA_plot(NHA_H9_res_full), MA_plot(F8_A2_res_full), MA_plot(F8_E10_res_full), nrow = 2, align = "v")
+plot_grid(MA_plot(NHA_CIC_DE_common_res_combined), 
+          MA_plot(F8_CIC_DE_common_res_combined),
+          MA_plot(L54_CIC_DE_common_res_combined),
+          nrow = 3, align = "v")
+```
+
+> Firstly, we can see that CIC targets are generally upregulated in CIC-KO cells, affirming our data and analysis. Secondly, transcriptional changes are more pronounced in terms of fold change in IDH-WT cells, especially downregulation.
+
+### **Volcano Plots** <a name="volcano"></a>
+
+----
+
+Another useful visualization of RNA-seq data is the volcano plot. In these plots, log2 fold change is on the X-axis while significance (-log10 q value) is on the Y-axis.s
+
+```{r, fig.align='center'}
+volcano_plot <- function(df, q_value) {
+	p <- ggplot(df, aes(log2FoldChange, -log10_padj, label = gene_ID)) +
+		geom_point(data = subset(df, padj >= q_value | abs(log2FoldChange <= 1)), size = 1.5, col = "grey", alpha = 0.5) +
+		geom_point(data = subset(df, padj < q_value & log2FoldChange > 1), size = 1.5, col = "#F95445", alpha = 0.7) +
+		geom_point(data = subset(df, padj < q_value & log2FoldChange < -1), size = 1.5, col = "#6FD865", alpha = 0.7) +
+		geom_point(data = subset(df, gene_ID %in% pos_genes), size = 2, alpha = 0.8) +
+		geom_text_repel(data = subset(df, gene_ID %in% pos_genes), aes(label = gene_ID), 
+										size = 4, fontface = "bold") +
+		geom_vline(xintercept = -1, linetype = "dotted") +
+		geom_vline(xintercept = 1, linetype = "dotted") +
+		geom_hline(yintercept = -log10(q_value), linetype = "dotted") +
+		labs(x = "Log2 Fold Change", y = "-Log10 Adjusted P-Value") +
+		theme(legend.position = "none",
+					axis.title = element_text(size = 15, face = "bold"),
+					axis.text = element_text(size = 14),
+					panel.grid.major = element_blank(), 
+					panel.grid.minor = element_blank(),
+          panel.background = element_blank(),
+					axis.line = element_line(colour = "black"))
+	
+	return(p)
+}
+
+plot_grid(volcano_plot(NHA_CIC_DE_common_res_combined, 0.01) + xlim(-10, 10), 
+          volcano_plot(F8_CIC_DE_common_res_combined, 0.01) + xlim(-10, 10),
+          volcano_plot(L54_CIC_DE_common_res_combined, 0.01) + xlim(-10, 10),
+          nrow = 3, align = "v")
+
+pdf(file = str_c(thesis, "volcano_plots.pdf"), height = 4)
+NHA <- volcano_plot(NHA_CIC_DE_common_res_combined, 0.01) + xlim(-10, 10) + ylim(0, 250)
+F8 <- volcano_plot(F8_CIC_DE_common_res_combined, 0.01) + xlim(-10, 10) + ylim(0, 250)
+volcano <- NHA + F8
+dev.off()
+
+ggsave(str_c(thesis, 'volcano.png'), dpi = 600, height = 4)
+
+
+volcano_plot2 <- function(df, q_value) {
+	p <- ggplot(df, aes(mean_log2_fc, -mean_log10_padj, label = gene_ID)) +
+		geom_point(data = subset(df, mean_padj >= q_value | abs(mean_fc <= 1.5)), size = 1.5, col = "grey", alpha = 0.5) +
+		geom_point(data = subset(df, mean_padj < q_value & mean_fc > 1.5), size = 1.5, col = "tomato", alpha = 0.7) +
+		geom_point(data = subset(df, mean_padj < q_value & mean_fc < -1.5), size = 1.5, col = "seagreen3", alpha = 0.7) +
+		geom_point(data = subset(df, gene_ID %in% pos_genes), size = 2, alpha = 0.8) +
+		geom_text_repel(data = subset(df, gene_ID %in% pos_genes), aes(label = gene_ID), 
+										size = 4, fontface = "bold") +
+		geom_vline(xintercept = -log2(1.5), linetype = "dotted") +
+		geom_vline(xintercept = log2(1.5), linetype = "dotted") +
+		geom_hline(yintercept = -log10(q_value), linetype = "dotted") +
+		labs(x = "Average Log2 Fold Change", y = "Average -Log10 Adjusted P-Value") +
+		theme(legend.position = "none",
+					axis.title = element_text(size = 15, face = "bold"),
+					axis.text = element_text(size = 14),
+					panel.grid.major = element_blank(), 
+					panel.grid.minor = element_blank(),
+          panel.background = element_blank(),
+					axis.line = element_line(colour = "black"))
+	
+	return(p)
+}
+```
+
+```
+pdf(file = "figs/tmp/NHA_volcano_plot.pdf", height = 4)
+volcano_plot(NHA_res_full, 0.01) + xlim(-10, 10)
+dev.off()
+
+v1 <- volcano_plot(NHA_res_full, 0.01) + xlim(-10, 10)
+save_plot("figs/tmp/NHA_volcano_plot.png", v1, base_height = 4, base_width = 6)
+
+
+pdf(file = "figs/tmp/F8_volcano_plot.pdf", height = 5)
+volcano_plot(F8_res_full, 0.01) + xlim(-10, 10)
+dev.off()
+
+v2 <- volcano_plot(F8_res_full, 0.01) + xlim(-10, 10)
+save_plot("figs/tmp/F8_volcano_plot.png", v2, base_height = 4, base_width = 6)
+```
+
+> Again, there is a clear pronouncement of downregulation in the IDH-WT context. 
+
+
+# Get RPKM values for each gene across samples
+```{r}
+all_counts_keep <- all_counts_keep %>% 
+  select(-contains("L54")) 
+
+all_counts_keep <- all_counts_keep[rowSums(all_counts_keep) > 0, ]
+
+ensembl_mapper_len <- ensembl_mapper %>% 
+  select(ensembl_ID, Length = length) %>% 
+  column_to_rownames("ensembl_ID")
+
+human <- useMart("ensembl", dataset="hsapiens_gene_ensembl")
+gene_coords = getBM(attributes = c("hgnc_symbol","ensembl_gene_id", "start_position","end_position"), 
+                    filters = "ensembl_gene_id", values = rownames(all_counts_keep), mart = human)
+gene_coords$size=gene_coords$end_position - gene_coords$start_position
+
+gene_sizes <- gene_coords %>% 
+  select(ensembl_gene_id, Length = size) %>%
+  unique() %>% 
+  remove_rownames() %>% 
+  column_to_rownames("ensembl_gene_id")
+
+library(edgeR)
+all_counts_keep_DGE <- DGEList(counts = all_counts_keep[rownames(all_counts_keep) %in% rownames(ensembl_mapper_len), ], genes = ensembl_mapper_len)
+all_counts_keep_DGE <- calcNormFactors(all_counts_keep_DGE)
+all_counts_keep_rpkm <- rpkm(all_counts_keep_DGE)
+
+saveRDS(all_counts_keep_rpkm, "/projects/marralab_cic_prj/rna_seq/R_objects/all_counts_keep_rpkm.rds")
+all_counts_keep_rpkm <- readRDS("/projects/marralab_cic_prj/rna_seq/R_objects/all_counts_keep_rpkm.rds")
+
+rpkm_df <- all_counts_keep_rpkm %>%
+  as.data.frame() %>% 
+  rownames_to_column("ensembl_ID") %>% 
+  left_join(ensembl_mapper %>% select(ensembl_ID, gene_ID)) %>% 
+  select(-ensembl_ID) %>% 
+  mutate(gene_ID = make.unique(gene_ID, sep = ".")) %>% 
+  column_to_rownames("gene_ID")
+
+plot_rpkm <- function(gene) {
+  df <- rpkm_df[rownames(rpkm_df) == gene, ] %>%
+    t() %>% 
+    as.data.frame() %>% 
+    rownames_to_column("sample") %>% 
+	  separate(sample, c("cell", "rep"), sep = "_") %>% 
+	  mutate(CIC = if_else(cell %in% c("F8", "NHA"), "CIC-WT", "CIC-KO"), 
+	         IDH1 = if_else(cell %like% "NHA", "WT", "R132H")) %>% 
+    gather(gene_ID, rpkm, -c(cell, rep, CIC, IDH1)) %>% 
+    mutate(log_rpkm = log2(rpkm + 1))
+  
+  df$cell <- factor(df$cell, levels = c("NHA", "NHAA2", "NHAH9", "F8", "F8A2", "F8E10"))
+  df$CIC <- factor(df$CIC, levels = c("CIC-WT", "CIC-KO"))
+  df$IDH1 <- as.factor(df$IDH1)
+  
+  padj <- compare_means(log_rpkm ~ cell, group.by = "gene_ID", data = df) %>% 
+    unite(comp, c("group1", "group2"), sep = "_") %>% 
+    filter(comp %in% c("F8_F8A2", "F8_F8E10", "NHA_NHAA2", "NHA_NHAH9")) %>% 
+    as.data.table()
+  
+  padj[comp == "F8_F8A2", p.adj := F8_A2_res_full$padj[match(gene_ID, F8_A2_res_full$gene_ID)]]
+  padj[comp == "F8_F8E10", p.adj := F8_E10_res_full$padj[match(gene_ID, F8_E10_res_full$gene_ID)]]
+  padj[comp == "NHA_NHAA2", p.adj := NHA_A2_res_full$padj[match(gene_ID, NHA_A2_res_full$gene_ID)]]
+  padj[comp == "NHA_NHAH9", p.adj := NHA_H9_res_full$padj[match(gene_ID, NHA_H9_res_full$gene_ID)]]
+  padj[, p.adj := round(p.adj, digits = 4)]
+  padj[, label := case_when(p.adj > 0.05 ~ "ns",
+                            p.adj <= 0.05 & p.adj > 0.01 ~ "*",
+                            p.adj <= 0.01 & p.adj > 0.001 ~ "**",
+                            p.adj <= 0.001 & p.adj > 0.0001 ~ "***",
+                            p.adj <= 0.0001 ~ "****")]
+  
+  NHA_max <- max(df$log_rpkm[df$cell %like% "NHA"])
+  F8_max <- max(df$log_rpkm[df$cell %like% "F8"])
+  sf <- (max(df$log_rpkm) - min(df$log_rpkm)) / 10
+  ypos <- c(NHA_max + sf, NHA_max + sf * 2, F8_max + sf, F8_max + sf * 2)
+  
+  padj <- padj %>% separate(comp, c("group1", "group2"), sep = "_") %>% mutate(y.pos = ypos)
+  
+  p <- ggplot(df, aes(cell, log2(rpkm + 1))) +
+    geom_boxplot(aes(fill = CIC)) +
+    labs(x = NULL, y = "Log2 RPKM", fill = NULL, title = gene) +
+    scale_fill_manual(values = c("dodgerblue3", "gray")) +
+    stat_pvalue_manual(data = padj, label = "label", xmin = "group1", xmax = "group2", y.position = "y.pos", tip.length = 0) +
+    my_theme +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1),
+          plot.title = element_text(size = 20),
+          panel.grid.major = element_line(linetype = "dashed", colour = "gainsboro"),
+          strip.background = element_rect(fill = "white", color = "white"),
+          strip.text = element_text(colour = "black", face = "bold", size = 15),
+          strip.placement = "outside",
+          panel.spacing = unit(2, "lines"),
+          legend.position = "none")
+  
+  return(p + expand_limits(y = c(min(df$log_rpkm) - sf, max(df$log_rpkm) + sf * 3)))
+}
+
+ #+ ylim(min(df$log_rpkm) - sf * 2, max(df$log_rpkm) + sf * 6)
+
+#confirmed CIC targets by ChIP-qPCR
+pdf(file = str_c(thesis, "CIC targets rpkm.pdf"), width = 6, height = 15)
+(plot_rpkm("DUSP4") + plot_rpkm("ETV1") + plot_rpkm("ETV4") + plot_rpkm("ETV5")) /
+(plot_rpkm("GPR3") + plot_rpkm("SHC3") + plot_rpkm("SHC4") + plot_rpkm("SPRY4"))
+dev.off()
+
+plot_rpkm("CDH2")
+
+plot_rpkm("CCND2") + plot_rpkm("NR2E1") + plot_rpkm("FOXG1") + plot_rpkm("HES1")
+
+plot_rpkm("DUSP6")
+
+plot_rpkm("CD24")
+
+plot_rpkm("PTEN") + plot_rpkm("DLL3")
+
+plot_rpkm("RBFOX3") + plot_rpkm("CSPG4") + plot_rpkm("OLIG2") + plot_rpkm("PDGFRA") + plot_rpkm("PDGFRB")
+
+#OPC markers
+plot_rpkm("CSPG4") + plot_rpkm("PDGFRA")
+
+#astrocyte markers
+plot_rpkm("ALDH1L1") + plot_rpkm("SLC1A3") + plot_rpkm("SLC1A2") + plot_rpkm("GFAP")
+
+plot_rpkm("LAMA1") + plot_rpkm("ADAMTS5") + plot_rpkm("ADAMTS14") + plot_rpkm("LOXL3")
+
+#ECM Degradation
+plot_rpkm("MMP2") + plot_rpkm("MMP11") + plot_rpkm("ADAMTS3") + plot_rpkm("PCOLCE2")
+
+#ECM Migration
+plot_rpkm("LAMA3") + plot_rpkm("LAMA4") + plot_rpkm("VCAN") + plot_rpkm("VCAN") 
+
+lgg_CIC_DE_genes <- read_excel("/projects/sdlee_prj/sdlee_prj_results/thesis/data/Type1 LGG CIC DE genes.xls", col_names = T) %>% 
+  mutate(direction = if_else(`Log2 Fold Change` < 0, "down", "up"))
+
+a <- F8_DE_q0.05_fc1.5 %>% filter(gene_ID %in% lgg_CIC_DE_genes$Gene & direction == lgg_CIC_DE_genes$direction[match(gene_ID, lgg_CIC_DE_genes$Gene)])
+b <- NHA_DE_q0.05_fc1.5 %>% filter(gene_ID %in% lgg_CIC_DE_genes$Gene & direction == lgg_CIC_DE_genes$direction[match(gene_ID, lgg_CIC_DE_genes$Gene)])
+
+plot_rpkm_fc <- function(gene) {
+  df <- rpkm_df[rownames(rpkm_df) %in% gene, ] %>%
+    t() %>% 
+    as.data.frame() %>% 
+    rownames_to_column("sample") %>% 
+    separate(sample, c("cell", "rep"), sep = "_") %>%
+    mutate(cell = factor(cell, levels = c("NHA", "NHAA2", "NHAH9", "F8", "F8A2", "F8E10")),
+           CIC = case_when(cell %in% c("F8", "NHA") ~ "CIC-WT",
+                           cell %in% c("NHAA2", "F8A2") ~ "CIC-KO1",
+                           cell %in% c("NHAH9", "F8E10") ~ "CIC-KO2"),
+           CIC = factor(CIC, levels = c("CIC-WT", "CIC-KO1", "CIC-KO2")),
+           IDH1 = if_else(cell %like% "NHA", "IDH1-WT", "IDH1-R132H"),
+           IDH1 = as.factor(IDH1) %>% fct_rev) %>% 
+    arrange(cell) %>% 
+    gather(gene_ID, rpkm, -c(cell, rep, CIC, IDH1)) %>% 
+    group_by(gene_ID, rep) %>% 
+    mutate(fc = (rpkm / first(rpkm)) - 1) %>% 
+    as.data.frame()
+
+  p <- ggplot(df, aes(IDH1, fc, fill = CIC)) +
+    geom_boxplot() +
+    scale_fill_manual(values = c("dodgerblue3", "aliceblue", "lightcyan")) +
+    scale_x_discrete(labels = c("IDH1\nWT", "IDH1\nR132H")) +
+    labs(x = NULL, y = "Fold change RPKM\n(Relative to CIC & IDH1-WT)", fill = NULL) +
+    facet_wrap(~gene_ID, scales = "free") +
+    my_theme +
+    theme(legend.position = "bottom",
+          strip.background = element_rect(fill = "white", color = "white"),
+          strip.text = element_text(colour = "black", face = "bold", size = 16),
+          strip.placement = "outside",
+          panel.grid.major = element_line(linetype = "dashed", color = "gainsboro"),
+          panel.spacing = unit(2, "lines"))
+  
+  return(p)
+}
+
+pdf(file = str_c(thesis, "rpkm fc known targets.pdf"), width = 12, height = 6)
+plot_rpkm_fc(c("DUSP4", "ETV1", "ETV4", "ETV5", "GPR3", "SHC3", "SHC4", "SPRY4")) + facet_wrap(~gene_ID, scales = "free", nrow = 2)
+dev.off()
+
+pdf(file = str_c(thesis, "rpkm fc ndev genes.pdf"), width = 12, height = 6)
+plot_rpkm_fc(c("HES5", "HEYL", "LIN28A", "LIN28B", "PDGFRA", "POU3F2", "NRG2", "NFIA")) + facet_wrap(~gene_ID, scales = "free", nrow = 2)
+dev.off()
+
+plot_rpkm_fc(c("LAMA3", "LAMA4", "VCAN")) + facet_wrap(~gene_ID, scales = "free", nrow = 2)
+
+
+plot_rpkm_fc(c("MMP2", "MMP11", "ADAMTS3", "PCOLCE2")) + facet_wrap(~gene_ID, scales = "free", nrow = 2)
+plot_rpkm_fc(c("LAMA1", "ADAMTS5", "ADAMTS14", "LOXL3")) + facet_wrap(~gene_ID, scales = "free", nrow = 2)
+plot_rpkm_fc(c("POU3F2", "ZIC1")) + facet_wrap(~gene_ID, scales = "free", nrow = 2)
+plot_rpkm_fc(c("BCL2", "CDC14B", "RUNX1")) + facet_wrap(~gene_ID, scales = "free", nrow = 2)
+
+
+# peaks called using macs2 (G144 CIC-WT vs IgG)
+Weiss_G144_mpeaks <- fread("/projects/marralab_cic_prj/Weissman_et_al/macs2_q0.05_peaks.sorted.anno.bed",
+                           col.names = c("chr", "start", "end", "peak_ID", "x1", "x2", "fc_summit", "log_q", "log_p", "summit_pos_to_start",
+                                         "x3", "gene_tss", "x4", "gene_ID", "dist")) %>% 
+  select(-contains("x")) %>% 
+  unique() %>% 
+  mutate(q = 10^(-log_q))
+
+# to map strand info
+geneinfo <- read.delim("/projects/marralab_cic_prj/shared_objects/tss_pad_1500_500.bed",
+                       header = F, col.names = c("chr", "start", "end", "strand", "ensembl_ID", "gene_ID", "x", "tss"), sep = '\t', stringsAsFactors = F)
+
+# peaks called using macs2 (G144 CIC-WT vs CIC-KO)
+Weiss_G144_WT_KO_mpeaks <- fread("/projects/marralab_cic_prj/Weissman_et_al/CIC_peaks/WT_KO/macs2_q0.05_peaks.sorted.anno.bed",
+                           col.names = c("chr", "start", "end", "peak_ID", "x1", "x2", "fc_summit", "log_q", "log_p", "summit_pos_to_start",
+                                         "x3", "gene_tss", "x4", "gene_ID", "dist")) %>% 
+  select(-contains("x")) %>% 
+  unique() %>% 
+  mutate(q = 10^(-log_q)) %>% 
+  left_join(geneinfo %>% select(gene_ID, strand)) %>% 
+  unique()
+
+ggplot(Weiss_G144_WT_KO_mpeaks, aes(log_q)) +
+  geom_violin()
+
+Weiss_G144_WT_KO_CIC_targets <- Weiss_G144_WT_KO_mpeaks %>%
+  mutate(is_prox = if_else((strand == 1 & dist >= -1500 & dist <= 500) | (strand == -1 & dist >= -500 & dist <= 1500), "proximal", "distal")) %>% 
+  filter(is_prox == "proximal", chr %in% c(1:22, "X", "Y")) %>% 
+  select(gene_ID, strand, is_prox) %>% 
+  unique() %>% 
+  mutate(motif = if_else(gene_ID %in% CIC_motif_hg19_anno_promoter$gene_ID, TRUE, FALSE))
+
+Weiss_G144_CIC_targets_tss_bed <- Weiss_G144_mpeaks %>%
+  filter(dist >= -1500 & dist <= 500, chr %in% c(1:22, "X", "Y")) %>% 
+  left_join(geneinfo %>% select(gene_ID, strand)) %>%
+  unique() %>% 
+  mutate(promoter_start = if_else(strand == 1, gene_tss - 500, gene_tss - 1500),
+         promoter_end = if_else(strand == 1, gene_tss + 1500, gene_tss - 500),
+         chr = str_c("chr", chr)) %>% 
+  select(chr, promoter_start, promoter_end, gene_ID) %>% 
+  unique()
+
+Weiss_G144_WT_KO_CIC_targets_tss_bed <- Weiss_G144_WT_KO_mpeaks %>%
+  filter(dist >= -1500 & dist <= 500, chr %in% c(1:22, "X", "Y")) %>% 
+  left_join(geneinfo %>% select(gene_ID, strand)) %>%
+  unique() %>% 
+  mutate(promoter_start = if_else(strand == 1, gene_tss - 500, gene_tss - 1500),
+         promoter_end = if_else(strand == 1, gene_tss + 1500, gene_tss - 500),
+         chr = str_c("chr", chr)) %>% 
+  select(chr, promoter_start, promoter_end, gene_ID) %>% 
+  unique()
+
+write_delim(Weiss_G144_CIC_targets_tss_bed, "/projects/marralab_cic_prj/Weissman_et_al/Weiss_G144_CIC_targets_tss.bed", delim = "\t", col_names = F)
+write_delim(Weiss_G144_WT_KO_CIC_targets_tss_bed, "/projects/marralab_cic_prj/Weissman_et_al/CIC_peaks/WT_KO/CIC_targets_tss.bed", delim = "\t", col_names = F)
+
+NHA_DE_CIC_targets <- NHA_q0.05 %>% 
+  filter(gene_ID %in% Weiss_G144_WT_KO_CIC_targets$gene_ID) %>% 
+  mutate(motif = if_else(gene_ID %in% CIC_motif_hg19_anno_promoter$gene_ID, TRUE, FALSE))
+
+Weiss_CIC_peaks_prox_NHA_DE <- Weiss_G144_WT_KO_mpeaks %>%
+  mutate(is_prox = if_else((strand == 1 & dist >= -1500 & dist <= 500) | (strand == -1 & dist >= -500 & dist <= 1500), "proximal", "distal")) %>% 
+  filter(is_prox == "proximal", chr %in% c(1:22, "X", "Y"), gene_ID %in% NHA_DE_CIC_targets$gene_ID)
+write_delim(Weiss_CIC_peaks_prox_NHA_DE, "/projects/marralab_cic_prj/Weissman_et_al/CIC_peaks/WT_KO/NHA_DE.bed", delim = "\t", col_names = F)
+
+NHA_DE_CIC_targets_cnv <- NHA_DE_CIC_targets %>% 
+  filter(gene_ID %in% NHA_cnv_genes$gene_ID)
+
+F8_DE_CIC_targets <- F8_q0.05 %>% 
+  filter(gene_ID %in% Weiss_G144_WT_KO_CIC_targets$gene_ID) %>% 
+  mutate(motif = if_else(gene_ID %in% CIC_motif_hg19_anno_promoter$gene_ID, TRUE, FALSE))
+
+lgg_type1_DE_CIC_targets <- lgg_type1_res_q0.05 %>% 
+  filter(gene_ID %in% Weiss_G144_WT_KO_CIC_targets$gene_ID) %>% 
+  mutate(motif = if_else(gene_ID %in% CIC_motif_hg19_anno_promoter$gene_ID, TRUE, FALSE))
+
+
+x <- NHA_DE_CIC_targets %>% 
+  filter(gene_ID %in% lgg_type1_res_q0.05$gene_ID)
+
+y <- F8_DE_CIC_targets %>% 
+  filter(gene_ID %in% lgg_type1_res_q0.05$gene_ID)
+
+lgg_DE_CIC_targets <- lgg_CIC_DE_genes %>% 
+  filter(Gene %in% Weiss_G144_CIC_targets$gene_ID) %>% 
+  mutate(motif = if_else(Gene %in% CIC_motif_hg19_anno_promoter$gene_ID, TRUE, FALSE))
+
+sum(NHA_DE_CIC_targets$gene_ID %in% lgg_DE_CIC_targets$Gene)
+sum(F8_DE_CIC_targets$gene_ID %in% lgg_DE_CIC_targets$Gene)
+
+lgg_F8_DE_CIC_targets <- F8_DE_CIC_targets %>% filter(gene_ID %in% lgg_DE_CIC_targets$Gene)
+lgg_F8_DE_CIC_targets2 <- lgg_DE_CIC_targets %>% filter(Gene %in% F8_DE_CIC_targets$gene_ID)
+
+plot_rpkm_fc("BCL2")
+plot_rpkm_fc(c("MFSD2A", "BCL2", "TRAPPC9", "BACH2"))
+
+
+F8_CIC_targets_rpkm_df <- rpkm_df[rownames(rpkm_df) %in% F8_DE_CIC_targets[F8_DE_CIC_targets$direction == "up", "gene_ID"], ] %>% 
+  as.data.frame() %>% 
+  select(F8_rep1, F8_rep2, F8_rep3, NHA_rep1, NHA_rep2, NHA_rep3) %>% 
+  rownames_to_column("gene_ID") %>% 
+  gather(cell_line, rpkm, contains("rep")) %>% 
+  mutate(IDH1 = if_else(cell_line %like% "NHA", "IDH1-WT", "IDH1-R132H"),
+         log2_rpkm = log2(rpkm +1)) %>% 
+  group_by(gene_ID, IDH1) %>% 
+  summarize(mean_rpkm = mean(rpkm)) %>% 
+  spread(IDH1, mean_rpkm) %>% 
+  mutate(fc = `IDH1-R132H`/`IDH1-WT`)
+  select(-cell_line, -rpkm)#%>% 
+  spread(IDH1, log2_rpkm)
+
+ggplot(F8_CIC_targets_rpkm_df, aes(IDH1, log2(rpkm + 1))) +
+  geom_boxplot()
+```
+
+
+
+### **Boxplots of Genes of Interest** <a name="boxplot"></a>
+
+----
+
+To look at certain genes of interest and compare their expression levels between samples, we can calculate counts per million (cpm) for each gene and visualize their values in boxplots. First let's take a look at the known CIC target genes.
+
+```{r, message=FALSE, fig.align='center'}
+library(edgeR)
+all_counts_keep <- all_counts %>% 
+  select(-contains("L54"))
+
+all_counts_keep <- all_counts_keep[rowSums(all_counts_keep) > 0, ]
+
+all_cpm_keep <- cpm(all_counts_keep, log = T) %>% 
+  as.data.frame() %>% 
+	rownames_to_column("ensembl_ID") %>%
+  left_join(ensembl_mapper %>% select(-c(chr, start, end))) %>% 
+  dplyr::select(-ensembl_ID) 
+
+all_cpm_keep$gene_ID <- make.unique(all_cpm_keep$gene_ID, sep = ".")
+all_cpm_keep <- all_cpm_keep %>% 
+  column_to_rownames("gene_ID")
+
+plot_cpm <- function(genes){
+  genes_cpm <- all_cpm_keep[rownames(all_cpm_keep) %in% genes, ]
+  
+  genes_cpm_df <- genes_cpm %>%
+    t() %>% 
+    as.data.frame() %>% 
+    rownames_to_column("sample") %>% 
+	  separate(sample, c("cell", "rep"), sep = "_") %>% 
+	  mutate(CIC = if_else(cell %in% c("F8", "NHA"), "CIC-WT", "CIC-KO"), IDH1 = if_else(cell %like% "NHA", "WT", "R132H")) %>% 
+    gather(gene_ID, cpm, one_of(genes))
+  
+  genes_cpm_df$cell <- factor(genes_cpm_df$cell, levels = c("NHA", "NHAA2", "NHAH9", "F8", "F8A2", "F8E10"))
+  genes_cpm_df$CIC <- factor(genes_cpm_df$CIC, levels = c("CIC-WT", "CIC-KO"))
+  genes_cpm_df$IDH1 <- as.factor(genes_cpm_df$IDH1)
+  
+  p <- ggplot(genes_cpm_df, aes(cell, cpm)) +
+    geom_boxplot(aes(fill = CIC)) +
+    labs(x = NULL, y = "Expression (log CPM)", fill = NULL) +
+    facet_grid(~gene_ID) +
+    scale_fill_manual(values = c("#666699", "#99CCFF")) +
+    theme(axis.title = element_text(size = 16, face = "bold"),
+        axis.text.x = element_text(size = 14, angle = 90), 
+        strip.text = element_text(size = 14, face = "bold"),
+        panel.grid.major = element_blank(), 
+				panel.grid.minor = element_blank(),
+        panel.background = element_blank(),
+				axis.line = element_line(colour = "black"),
+        legend.text = element_text(size = 14),
+        legend.position = "bottom")
+  
+  return(p)
+}
+
+plot_cpm(pos_genes)
+plot_cpm("CCND2")
+
+bound_genes <- str_c("RE")
+
+TET_genes <- c("TET1", "TET2", "TET3")
+plot_cpm(TET_genes)
+
+TET_cpm_keep <- all_cpm_keep[rownames(all_cpm_keep) %in% TET_genes, ]
+
+
+TET_cpm_df <- TET_cpm_keep %>%
+    t() %>% 
+    as.data.frame() %>% 
+    rownames_to_column("sample") %>% 
+	  separate(sample, c("cell", "rep"), sep = "_") %>% 
+	  mutate(CIC = if_else(cell %in% c("F8", "NHA", "L54"), "CIC-WT", "CIC-KO"), IDH1 = if_else(cell %like% "NHA", "WT", "R132H")) %>% 
+    gather(gene_ID, cpm, one_of(genes))
+
+```
+
+> We can note greater diferences in expression for most of these genes in the cell lines expressing IDH1-R132H.
+
+We also recently identified PLK3 and HMGA1 as novel CIC target genes in the NHA cell line by CIC ChIP-qPCR. Let's look at these in our samples.
+
+```{r, fig.align='center'}
+plot_cpm(genes = c("PLK3", "HMGA1"))
+```
+
+
+One of the top downregulated genes in the NHA cell line model is MGMT, a gene that encodes for Methylguanine Methyltransferase. Hypermethylation of the MGMT promoter is highly associated with sensitivity to Temozolomide. 
+
+```{r, fig.align='center'}
+plot_cpm("MGMT")
+```
+
+```
+pdf(file = "figs/MGMT_boxplot.pdf", height = 4, width = 5)
+plot_cpm("MGMT")
+dev.off()
+```
+
+```{r}
+# genes encoding for markers of different cell types along the glial cell lineage
+glial_dev_genes <- c("SOX2", "NES", "OLIG2", "PDGFRA", "CSPG4", "CLDN11", "MBP")
+plot_cpm(glial_dev_genes)
+```
+
+
+### **TF Enrichment Analysis** <a name="gsea"></a>
+https://amp.pharm.mssm.edu/chea3/#top
+```{r}
+anno_df <- data.frame(CIC = rep(c(rep("WT", 3), rep("KO", 6)), 2), IDH1 = c(rep("R132H", 9), rep("WT", 9)))
+rownames(anno_df) <- colnames(all_counts_keep)
+
+NHA_chea3 <- fread("/projects/sdlee_prj/sdlee_prj_results/thesis/data/chea3/NHA_DEG_q0.05_CHEA3.tsv") %>% 
+  rowwise() %>% 
+  mutate(n_genes = Overlapping_Genes %>% strsplit(split = ",") %>% simplify() %>% length()) %>% 
+  left_join(ensembl_mapper %>% select(TF = gene_ID, ensembl_ID, description)) %>% 
+  select(ensembl_ID, TF, Score, n_genes, description) %>% na.omit()
+
+F8_chea3 <- fread("/projects/sdlee_prj/sdlee_prj_results/thesis/data/chea3/F8_DEG_q0.05_CHEA3.tsv") %>% 
+  rowwise() %>% 
+  mutate(n_genes = Overlapping_Genes %>% strsplit(split = ",") %>% simplify() %>% length()) %>% 
+  left_join(ensembl_mapper %>% select(TF = gene_ID, ensembl_ID, description)) %>% 
+  select(ensembl_ID, TF, Score, n_genes, description) %>% na.omit()
+
+
+
+a <- all_counts_keep[rownames(all_counts_keep) %in% NHA_chea3$ensembl_ID[1:50], ] %>% 
+    rownames_to_column("ensembl_ID") %>% 
+    left_join(ensembl_mapper) %>% 
+    column_to_rownames("gene_ID") %>% 
+    dplyr::select(-c(ensembl_ID,  chr, start, end, strand, description)) %>% 
+    na.omit() %>% 
+    as.matrix()
+  
+pheatmap(a, 
+           col = colorRampPalette(c("seagreen3", "white", "tomato"))(100), 
+           scale = "row",
+           cluster_rows = T, 
+           cluster_cols = F, 
+           show_rownames = T,
+           show_colnames = F, 
+           annotation_col = anno_df, 
+           annotation_colors = anno_colors)
+
+b <- all_counts_keep[rownames(all_counts_keep) %in% F8_chea3$ensembl_ID[1:50], ] %>% 
+    rownames_to_column("ensembl_ID") %>% 
+    left_join(ensembl_mapper) %>% 
+    column_to_rownames("gene_ID") %>% 
+    dplyr::select(-c(ensembl_ID,  chr, start, end, strand, description)) %>% 
+    na.omit() %>% 
+    as.matrix()
+
+pheatmap(b, 
+           col = colorRampPalette(c("seagreen3", "white", "tomato"))(100), 
+           scale = "row",
+           cluster_rows = T, 
+           cluster_cols = F, 
+           show_rownames = T,
+           show_colnames = F, 
+           annotation_col = anno_df, 
+           annotation_colors = anno_colors)
+```
+
+----
+
+#### **Metascape** <a name="metascape"></a>
+
+[**Metascape**](http://metascape.org/)
+
+```{r}
+library(readxl)
+wd <- "/projects/sdlee_prj/sdlee_prj_results/thesis/"
+
+NHA_DE_up <- read_excel(str_c(wd, "data/metascape/NHA_q0.05_up.xlsx"), sheet = 2)
+NHA_DE_down <- read_excel(str_c(wd, "data/metascape/NHA_q0.05_down.xlsx"), sheet = 2)
+
+NHA_DE_up_nocnv <- read_excel(str_c(wd, "data/metascape/NHA_DE_up_nocnv.xlsx"), sheet = 2)
+NHA_DE_down_nocnv <- read_excel(str_c(wd, "data/metascape/NHA_DE_down_nocnv.xlsx"), sheet = 2)
+
+F8_DE_up <- read_excel(str_c(wd, "data/metascape/F8_q0.05_up.xlsx"), sheet = 2)
+F8_DE_down <- read_excel(str_c(wd, "data/metascape/F8_q0.05_down.xlsx"), sheet = 2)
+
+NHA_DE_up_nocnv <- read_excel(str_c(wd, "data/metascape/NHA_DE_q0.05_fc1.5_up_nocnv.xlsx"), sheet = 2)
+NHA_DE_down_nocnv <- read_excel(str_c(wd, "data/metascape/NHA_DE_q0.05_fc1.5_down_nocnv.xlsx"), sheet = 2)
+
+
+clean_ms <- function(x) {
+  df <- x %>% 
+    unite(pathway, c("Term", "Description"), sep = ": ") %>% 
+    select(pathway, logp = LogP, log_q = `Log(q-value)`) %>% 
+    distinct() %>% 
+    arrange(log_q) %>% 
+    head(10)
+  
+  return(df)
+}
+
+NHA_metascape <- rbind(clean_ms(NHA_DE_up) %>% mutate(direction = "up"),
+                       clean_ms(NHA_DE_down) %>% mutate(direction = "down")) %>% 
+  mutate(direction = factor(direction, levels = c("down", "up"))) %>% 
+  group_by(direction) %>% 
+  arrange(direction, log_q)
+
+NHA_metascape_nocnv <- rbind(clean_ms(NHA_DE_up_nocnv) %>% mutate(direction = "up"),
+                       clean_ms(NHA_DE_down_nocnv) %>% mutate(direction = "down")) %>% 
+  mutate(direction = factor(direction, levels = c("down", "up"))) %>% 
+  group_by(direction) %>% 
+  arrange(direction, logp)
+
+F8_metascape <- rbind(clean_ms(F8_DE_up) %>% mutate(direction = "up"),
+                      clean_ms(F8_DE_down) %>% mutate(direction = "down")) %>% 
+  mutate(direction = factor(direction, levels = c("down", "up"))) %>% 
+  group_by(direction) %>% 
+  arrange(direction, logp)
+
+# to avoid duplicate when plotting
+F8_metascape[F8_metascape$pathway == "R-HSA-1474244: Extracellular matrix organization" & F8_metascape$direction == "down", ]$pathway <- " R-HSA-1474244: Extracellular matrix organization"
+F8_metascape[F8_metascape$pathway == "GO:0050803: regulation of synapse structure or activity" & F8_metascape$direction == "down", ]$pathway <- " GO:0050803: regulation of synapse structure or activity"
+
+
+plot_metascape <- function(x) {
+  p <- ggplot(x, aes(pathway %>% factor(levels = x$pathway) %>% fct_rev(), -log_q, fill = direction)) +
+    geom_col() +
+    coord_flip() +
+    scale_fill_manual(values = c("seagreen3", "tomato")) +
+    labs(x = NULL, y = "-Log10 Adjusted P-Value") +
+    theme(legend.position = "none",
+  				axis.title = element_text(size = 15, face = "bold"),
+  				axis.text = element_text(size = 14),
+  				axis.text.y = element_text(face = "bold"), 
+  				panel.grid.major = element_blank(), 
+  				panel.grid.minor = element_blank(),
+          panel.background = element_blank(),
+  				axis.line = element_line(colour = "black"))
+  
+  return(p)
+}
+
+pdf(file = str_c(thesis, "metascape_q0.05.pdf"), height = 10, width = 15)
+NHA_meta_p <- plot_metascape(NHA_metascape) + ylim(0, 10)
+F8_meta_p <- plot_metascape(F8_metascape) + ylim(0, 10)
+NHA_meta_p / F8_meta_p
+dev.off()
+
+pdf(file = str_c(thesis, "metascape_nocnv.pdf"), height = 10, width = 15)
+NHA_meta_p_nocnv <- plot_metascape(NHA_metascape_nocnv) + ylim(0, 10)
+F8_meta_p <- plot_metascape(F8_metascape) + ylim(0, 10)
+
+NHA_meta_p_nocnv / F8_meta_p
+dev.off()
+```
+
+```
+all_logcounts_gene_id <- all_logcounts %>% 
+  rownames_to_column("ensembl_ID") %>% 
+  left_join(ensembl_mapper) #%>% 
+  column_to_rownames("gene_ID") %>% 
+  dplyr::select(-ensembl_ID)
+
+library(biomaRt)
+ensembl = useMart("ensembl",dataset="hsapiens_gene_ensembl") #uses human ensembl annotations
+
+anno_df <- data.frame(CIC = rep(c(rep("WT", 2), rep("KO", 4)), 3), IDH1 = c(rep("R132H", 9), rep("WT", 9)))
+rownames(anno_df) <- colnames(all_counts_keep)
+
+anno_colors = list(CIC = c("firebrick1", "dodgerblue1"), IDH1 = c("forestgreen", "darkorange"))
+names(anno_colors$CIC) <- unique(anno_df$CIC)
+names(anno_colors$IDH1) <- unique(anno_df$IDH1)
+
+
+go_heatmap <- function(counts, go_ids){
+  genes <- getBM(attributes = c('hgnc_symbol', 'ensembl_transcript_id', 'go_id'),
+                 filters = 'go', values = go_ids, mart = ensembl) %>% 
+    dplyr::select(gene_ID = hgnc_symbol) %>% 
+    unique() %>% 
+    left_join(ensembl_mapper)
+  
+  select <- counts[rownames(counts) %in% genes$ensembl_ID, ] %>% 
+    rownames_to_column("ensembl_ID") %>% 
+    left_join(ensembl_mapper) %>% 
+    column_to_rownames("gene_ID") %>% 
+    dplyr::select(-c(ensembl_ID,  chr, start, end)) %>% 
+    na.omit() %>% 
+    as.matrix()
+  
+  pheatmap(select, 
+           col = colorRampPalette(c("seagreen3", "white", "tomato"))(100), 
+           scale = "row",
+           cluster_rows = T, 
+           cluster_cols = F, 
+           show_rownames = T,
+           show_colnames = F, 
+           annotation_col = anno_df, 
+           annotation_colors = anno_colors)
+}
+
+go_heatmap(all_logcounts, "GO:1901185")
+go_heatmap(all_logcounts, "GO:0007169")
+go_heatmap(all_logcounts, "GO:0090307")
+#neuron migration
+go_heatmap(all_logcounts, "GO:0001764")
+#oligodendrocyte differentiation
+go_heatmap(all_counts_keep, "GO:0048709")
+
+#NSC proliferation
+go_heatmap(all_counts_keep, "GO:0061351")
+
+#glial proliferation
+go_heatmap(all_counts_keep, "GO:0014009")
+
+#astrocyte differentiation
+go_heatmap(all_counts_keep, "GO:0048708")
+
+#OPC proliferation
+go_heatmap(all_counts_keep, "GO:0070444")
+
+OPC_genes <- getBM(attributes = c('hgnc_symbol', 'ensembl_transcript_id', 'go_id'),
+                 filters = 'go', values = "GO:0070444", mart = ensembl) %>% 
+    dplyr::select(gene_ID = hgnc_symbol) %>% 
+    unique() %>% 
+    left_join(ensembl_mapper)
+    
+select <- all_counts[rownames(all_counts) %in% OPC_genes$ensembl_ID, ] %>% 
+    rownames_to_column("ensembl_ID") %>% 
+    left_join(ensembl_mapper) %>% 
+    column_to_rownames("gene_ID") %>% 
+    dplyr::select(-c(ensembl_ID,  chr, start, end)) %>% 
+    as.matrix()
+    
+    pheatmap(select, 
+           col = colorRampPalette(c("seagreen3", "white", "tomato"))(100), 
+           scale = "row",
+           cluster_rows = T, 
+           cluster_cols = F, 
+           show_rownames = T,
+           show_colnames = F, 
+           annotation_col = anno_df, 
+           annotation_colors = anno_colors)
+```
+
+```
+library(VennDiagram)
+NHA_DE_unique <- NHA_CIC_DE_common_res_q0.01 %>% 
+  filter(!(gene_ID %in% F8_CIC_DE_common_res_q0.01$gene_ID))
+write_csv(NHA_DE_unique, "results/NHA_DE_unique.csv")
+
+F8_DE_unique <- F8_CIC_DE_common_res_q0.01 %>% 
+  filter(!(gene_ID %in% NHA_CIC_DE_common_res_q0.01$gene_ID))
+write_csv(F8_DE_unique, "results/F8_DE_unique.csv")
+
+NHA_F8_DE_common <- NHA_CIC_DE_common_res_q0.01 %>% 
+  filter(gene_ID %in% F8_CIC_DE_common_res_q0.01$gene_ID)
+write_csv(NHA_F8_DE_common, "results/NHA_F8_DE_common.csv")
+
+draw.pairwise.venn(nrow(NHA_CIC_DE_common_res_q0.01), nrow(F8_CIC_DE_common_res_q0.01), nrow(NHA_F8_DE_common), 
+                   category = c("DE genes NHA", "DE genes F8"))
+```
+
+```{r}
+sugi_genes <- c("ERCC2", "ERCC3", "GTF2H1", "GTF2H4", "GTF2H2", "GTF2H3", "GTF2H5", "CDK7", "MNAT1", "CCNH")
+
+NHA_CIC_DE_common_res_q0.01 %>% filter(gene_ID %in% sugi_genes)
+F8_CIC_DE_common_res_q0.01 %>% filter(gene_ID %in% sugi_genes)
+L54_CIC_DE_common_res_q0.01 %>% filter(gene_ID %in% sugi_genes)
+
+plot_cpm(sugi_genes)
+```
+
+```{r}
+volcano_plot <- function(df, q_value) {
+  require(ggrepel)
+	p <- ggplot(df, aes(log2FoldChange, -log10_padj, label = gene_ID)) +
+		geom_point(data = subset(df, padj >= q_value), size = 1.5, col = "grey", alpha = 0.5) +
+		geom_point(data = subset(df, padj < q_value & log2FoldChange >= 1), size = 1.5, col = "#F95445", alpha = 0.7) +
+		geom_point(data = subset(df, padj < q_value & log2FoldChange <= -1), size = 1.5, col = "#6FD865", alpha = 0.7) +
+	  geom_point(data = subset(df, gene_ID %in% pos_genes), size = 2, alpha = 0.8) +
+		geom_text_repel(data = subset(df, gene_ID %in% pos_genes), aes(label = gene_ID), 
+										size = 4, fontface = "bold", arrow = arrow(length = unit(0.02, "npc")))  +
+		geom_vline(xintercept = -1, linetype = "dotted") +
+		geom_vline(xintercept = 1, linetype = "dotted") +
+		geom_hline(yintercept = -log10(q_value), linetype = "dotted") +
+		labs(x = "Log2 Fold Change", y = "-Log10 Adjusted P-Value") +
+		theme(legend.position = "none",
+					axis.title = element_text(size = 15, face = "bold"),
+					axis.text = element_text(size = 14),
+					panel.grid.major = element_blank(), 
+					panel.grid.minor = element_blank(),
+          panel.background = element_blank(),
+					axis.line = element_line(colour = "black"))
+	
+	return(p)
+}
+
+NHA_CIC_DE_common_res_q0.01 <- readRDS("/projects/marralab_cic_prj/rna_seq/R_objects/NHA_CIC_DE_common_res_q0.01.rds")
+NHA_res_full <- readRDS("/projects/marralab_cic_prj/rna_seq/R_objects/NHA_res_full.rds")
+
+pdf(file = "/projects/marralab_cic_prj/NHA_volcano_tmp.pdf", width = 5, height = 4)
+volcano_plot(NHA_res_full, 0.01) +
+  xlim(c(-10, 10)) +
+  ylim(c(0, 160))
+dev.off()
+
+F8_res_full <- readRDS("/projects/marralab_cic_prj/rna_seq/R_objects/F8_res_full.rds")
+
+pdf(file = "/projects/marralab_cic_prj/F8_volcano_tmp.pdf", width = 5, height = 4)
+volcano_plot(F8_res_full, 0.01) +
+  xlim(c(-10, 10)) +
+  ylim(c(0, 160))
+dev.off()
+```
+
+
+```{r}
+get_common_DE_genes <- function(df1, df2) {
+  require(metap)
+  cell_line_1 <- unlist(str_split(deparse(substitute(df1)), "_"))[2]
+  cell_line_2 <- unlist(str_split(deparse(substitute(df2)), "_"))[2]
+  
+  stat_cols <- c("baseMean", "log2FoldChange", "lfcSE", "stat", "pvalue", "padj", "log10_padj", "direction")
+  
+  colnames(df1) <- c("ensembl_ID", "gene_ID", "chromosome", "biotype", str_c(stat_cols, "_1"))
+  colnames(df2) <- c("ensembl_ID", "gene_ID", "chromosome", "biotype", str_c(stat_cols, "_2"))
+  
+  CIC_DE_res <- df1 %>% 
+    left_join(df2 %>% dplyr::select(-ensembl_ID, -chromosome, -biotype), by = "gene_ID") %>% 
+    na.omit() %>% 
+    # exclude DE genes that have opposite directionality in the two CIC-KO cell lines
+    filter(direction_1 == direction_2) %>% 
+    mutate(direction = as.factor(direction_1)) %>% 
+    rowwise() %>% 
+    # a p_value of 0 are due to it being less than the smallest representable positive double-precision floating point value
+    # to avoid invalid p values in the sumlog function, add a tiny amount 
+    dplyr::select(-c(direction_1, direction_2))
+
+  return(CIC_DE_res)
+}
+combine_DE_genes <- function(common_res, threshold = 0.01){
+  require(metap)
+  combined_res <- common_res %>% 
+    filter(padj_1 < threshold, padj_2 < threshold) %>% 
+    mutate(baseMean = mean(baseMean_1, baseMean_2),
+           log2FoldChange = mean(log2FoldChange_1, log2FoldChange_2),
+           pvalue = sumlog(c((pvalue_1 + 3e-324), (pvalue_2 + 3e-324)))$p,
+           padj = sumlog(c((padj_1 + 3e-324), (padj_2+ 3e-324)))$p,
+           log10_padj = log10(padj)) %>% 
+    dplyr::select(-contains("_1"), -contains("_2")) %>% 
+    arrange(padj)
+  
+  return(combined_res)
+}
+
+NHAA2_res_full_cnv_filt <- NHAA2_res_full_cnv %>% 
+  filter(is.na(cnv)) %>% select(-cnv)
+
+NHAH9_res_full_cnv_filt <- NHAH9_res_full_cnv %>% 
+  filter(is.na(cnv)) %>% select(-cnv)
+
+NHA_CIC_DE_common_res_cnv_filt <- get_common_DE_genes(NHAA2_res_full_cnv_filt, NHAH9_res_full_cnv_filt) %>% 
+  combine_DE_genes(threshold = 1)
+
+NHA_CIC_DE_common_res_combined
+
+volcano_plot(NHA_CIC_DE_common_res_combined, 0.01) +
+  xlim(c(-10, 10))
+
+NHA_CIC_DE_common_res_q0.01_cnv_filt <- get_common_DE_genes(NHAA2_res_full_cnv_filt, NHAH9_res_full_cnv_filt) %>% 
+  combine_DE_genes()
+volcano_plot(NHA_CIC_DE_common_res_cnv_filt, 0.01) +
+  xlim(c(-10, 10))
+
+volcano_plot_cnv <- function(df, q_value) {
+	p <- ggplot(df, aes(log2FoldChange, -log10_padj)) +
+		geom_point(data = subset(df, padj >= q_value), size = 1.5, col = "grey", alpha = 0.5) +
+		geom_point(data = subset(df, padj < q_value & log2FoldChange >= 1), size = 1.5, col = "#F95445", alpha = 0.7) +
+		geom_point(data = subset(df, padj < q_value & log2FoldChange <= -1), size = 1.5, col = "#6FD865", alpha = 0.7) +
+		geom_vline(xintercept = -1, linetype = "dotted") +
+		geom_vline(xintercept = 1, linetype = "dotted") +
+		geom_hline(yintercept = -log10(q_value), linetype = "dotted") +
+		labs(x = "Log2 Fold Change", y = "-Log10 Adjusted P-Value") +
+		theme(legend.position = "none",
+					axis.title = element_text(size = 15, face = "bold"),
+					axis.text = element_text(size = 14),
+					panel.grid.major = element_blank(), 
+					panel.grid.minor = element_blank(),
+          panel.background = element_blank(),
+					axis.line = element_line(colour = "black"))
+	
+	return(p)
+}
+
+pdf(file = "/projects/marralab_cic_prj/NHA_volcano_cnv.pdf", width = 5, height = 4)
+volcano_plot_cnv(NHA_CIC_DE_common_res_cnv_filt, 0.01) +
+  xlim(c(-10, 10))
+dev.off()
+```
+
+# TCGA LGG RNA-seq DATA
+```{r}
+tcga_cases <- read_excel("/projects/marralab_cic_prj/tcga/tcga_glioma_cases_ceccarelli.xlsx", sheet = 1, col_names = T, skip = 1) %>% 
+  select(Case, Study, `IDH status`, `1p/19q codeletion`, mol_status = `IDH/codel subtype`)
+
+lgg_cases <- tcga_cases %>% 
+  filter(Study %like% "Lower Grade Glioma")
+
+CIC_mut_cases <- fread("/projects/marralab_cic_prj/tcga/tcga_CIC_mut_cases.tsv")
+
+lgg_cases <- lgg_cases %>% 
+  mutate(CIC = if_else(Case %in% CIC_mut_cases$`Case ID`, "CIC_mut", "CIC_WT"))
+
+lgg_type1_cases <- lgg_cases %>% 
+  filter(mol_status == "IDHmut-codel")
+
+lgg_sample_sheet <- fread("/projects/marralab_cic_prj/tcga/rna_seq/tcga_lgg_sample_sheet.tsv") %>% 
+  select(file = `File Name`, Case = `Case ID`) %>% 
+  left_join(lgg_cases %>% select(Case, mol_status, CIC)) %>% 
+  mutate(file = str_replace(file, ".gz", ""))
+
+lgg_type1_files <- lgg_sample_sheet %>% 
+  filter(mol_status == "IDHmut-codel")
+
+ensembl_ids <- fread("/projects/marralab_cic_prj/tcga/rna_seq/counts/a7c0fa0b-3b27-41a5-85cb-4ac5fd9956a5.htseq.counts", 
+                     col.names = c("ensembl_ID", "count"))
+
+read_counts <- function(x) {
+  df <- fread(x, col.names = c("ensembl_ID", "count")) %>% select(count)
+  
+  return(df)
+}
+
+tcga_lgg_rna_counts_files <- str_subset(list.files("/projects/marralab_cic_prj/tcga/rna_seq/counts"), lgg_type1_cases$Case)
+tcga_lgg_rna_counts_files_cases <- data.frame(file = tcga_lgg_rna_counts_files) %>% 
+  left_join(lgg_sample_sheet)
+
+counts_df <- map(str_c("/projects/marralab_cic_prj/tcga/rna_seq/counts/", lgg_type1_files$file), read_counts) %>% 
+  bind_cols() %>%
+  mutate(ensembl_ID = ensembl_ids$ensembl_ID) %>% 
+  column_to_rownames("ensembl_ID")
+
+colnames(counts_df) <- lgg_type1_files$file
+
+type1_lgg_counts <- counts_df %>% as.matrix()
+```
+
+# DE analysis between CIC-WT and mut LGG samples
+```{r}
+lgg_type1_colData <- lgg_type1_files %>% 
+  mutate(CIC = if_else(CIC == "CIC_WT", "WT", "mut"), type = "paired-end") %>% 
+  select(file, type, CIC) %>% 
+  column_to_rownames("file")
+
+lgg_type1_colData$CIC <- factor(lgg_type1_colData$CIC, levels = c("WT", "mut"))
+
+lgg_type1_dds <- DESeq(DESeqDataSetFromMatrix(countData = type1_lgg_counts, colData = lgg_type1_colData, design = ~ CIC))
+lgg_type1_res <- results(lgg_type1_dds, alpha = 0.05)
+
+lgg_type1_res_full <- lgg_type1_res %>% 
+  na.omit() %>% 
+  as.data.frame() %>% 
+  rownames_to_column("ensembl_ID") %>% 
+  arrange(padj) %>% 
+  separate(ensembl_ID, c("ensembl_ID", "x"), sep = "\\.") %>% 
+  left_join(ensembl_mapper %>% select(ensembl_ID, gene_ID)) %>%
+  mutate(direction = if_else(log2FoldChange < 0, "down", "up"),
+         fc = if_else(direction == "down", 2^(-log2FoldChange) * -1, 2^(log2FoldChange)))
+
+lgg_type1_res_q0.05 <- lgg_type1_res %>% 
+  na.omit() %>% 
+  as.data.frame() %>% 
+  rownames_to_column("ensembl_ID") %>% 
+  filter(padj <= 0.05) %>% 
+  arrange(padj) %>% 
+  separate(ensembl_ID, c("ensembl_ID", "x"), sep = "\\.") %>% 
+  left_join(ensembl_mapper %>% select(ensembl_ID, gene_ID)) %>%
+  mutate(direction = if_else(log2FoldChange < 0, "down", "up"),
+         fc = if_else(direction == "down", 2^(-log2FoldChange) * -1, 2^(log2FoldChange))) %>% 
+  na.omit()
+
+lgg_type1_res_q0.05_fc <- lgg_type1_res_q0.05 %>% filter(abs(fc) >= 1) %>% na.omit()
+lgg_type1_res_q0.05_fc <- lgg_type1_res_q0.05 %>% filter(abs(fc) >= 1.5) %>% na.omit()
+
+b <- lgg_type1_res_q0.05 %>% filter(gene_ID %in% F8_DE_CIC_targets$gene_ID)
+a <- lgg_type1_res_q0.05 %>% filter(gene_ID %in% NHA_DE_CIC_targets$gene_ID)
+
+# volcano plot for lgg type1
+pdf(file = str_c(thesis, "lgg_type1_CIC_DE_volcano.pdf"), height = 6, width = 8)
+ggplot(lgg_type1_res_full, aes(log2FoldChange, -log10(padj), label = gene_ID)) +
+  geom_point(data = subset(lgg_type1_res_full, padj >= 0.05), size = 1.5, col = "grey", alpha = 0.5) +
+	geom_point(data = subset(lgg_type1_res_full, padj < 0.05 & direction == "up"), size = 1.5, col = "tomato", alpha = 0.7) +
+	geom_point(data = subset(lgg_type1_res_full, padj < 0.05 & direction == "down"), size = 1.5, col = "seagreen3", alpha = 0.7) +
+  geom_point(data = subset(lgg_type1_res_full, gene_ID %in% lgg_type1_DE_CIC_targets$gene_ID), size = 2, col = "black", alpha = 0.8) +
+  geom_text_repel(data = subset(lgg_type1_res_full, gene_ID %in% lgg_type1_DE_CIC_targets$gene_ID), aes(label = gene_ID), 
+									size = 4, force = 10, fontface = "bold", segment.color = "gray30", segment.alpha = 0.7) +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", colour = "gainsboro") +
+  labs(x = "Log2 Fold Change", y = "-Log10 Adjusted P-Value") +
+	theme(legend.position = "none",
+				axis.title = element_text(size = 15, face = "bold"),
+				axis.text = element_text(size = 14),
+				panel.grid.major = element_blank(), 
+				panel.grid.minor = element_blank(),
+        panel.background = element_blank(),
+				axis.line = element_line(colour = "black"))
+dev.off()
+
+a <- sample_n(lgg_type1_res_full %>% filter(padj >= 0.05), 3000)
+
+lgg_type1_res_fullz <- lgg_type1_res_full %>% 
+  filter(padj < 0.05) %>% 
+  rbind(a) %>% 
+  left_join(ensembl_mapper_type %>% select(gene_ID, biotype)) %>% 
+  filter(biotype == "protein_coding")
+  
+
+# volcano plot for lgg type1, filter out protein coding genes for faster rendering
+pdf(file = str_c(thesis, "lgg_type1_CIC_DE_volcano.pdf"), height = 6, width = 8)
+ggplot(lgg_type1_res_fullz, aes(log2FoldChange, -log10(padj), label = gene_ID)) +
+  geom_point(data = subset(lgg_type1_res_fullz, padj >= 0.05), size = 1.5, col = "grey", alpha = 0.5) +
+	geom_point(data = subset(lgg_type1_res_fullz, padj < 0.05 & direction == "up"), size = 1.5, col = "tomato", alpha = 0.7) +
+	geom_point(data = subset(lgg_type1_res_fullz, padj < 0.05 & direction == "down"), size = 1.5, col = "seagreen3", alpha = 0.7) +
+  geom_point(data = subset(lgg_type1_res_fullz, gene_ID %in% lgg_type1_DE_CIC_targets$gene_ID), size = 2, col = "black", alpha = 0.8) +
+  geom_text_repel(data = subset(lgg_type1_res_fullz, gene_ID %in% lgg_type1_DE_CIC_targets$gene_ID), aes(label = gene_ID), 
+									size = 4, force = 10, fontface = "bold", segment.color = "gray35", segment.alpha = 0.7) +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", colour = "gainsboro") +
+  labs(x = "Log2 Fold Change", y = "-Log10 Adjusted P-Value") +
+  xlim(-2.5, 2.5) +
+  ylim(-1, 30) +
+	theme(legend.position = "none",
+				axis.title = element_text(size = 15, face = "bold"),
+				axis.text = element_text(size = 14),
+				panel.grid.major = element_blank(), 
+				panel.grid.minor = element_blank(),
+        panel.background = element_blank(),
+				axis.line = element_line(colour = "black"))
+dev.off()
+
+ggplot(df, aes(log2FoldChange, -log10_padj)) +
+		geom_point(data = subset(df, padj >= q_value | abs(fc <= 1.5)), size = 1.5, col = "grey", alpha = 0.5) +
+		geom_point(data = subset(df, padj < q_value & fc > 0), size = 1.5, col = "tomato", alpha = 0.7) +
+		geom_point(data = subset(df, padj < q_value & fc < 0), size = 1.5, col = "seagreen3", alpha = 0.7) +
+		geom_hline(yintercept = -log10(q_value), linetype = "dotted") +
+		labs(x = "Log2 Fold Change", y = "-Log10 Adjusted P-Value") +
+		theme(legend.position = "none",
+					axis.title = element_text(size = 15, face = "bold"),
+					axis.text = element_text(size = 14),
+					panel.grid.major = element_blank(), 
+					panel.grid.minor = element_blank(),
+          panel.background = element_blank(),
+					axis.line = element_line(colour = "black"))
+
+#how many DE genes overlap between cell lines and lgg type 1
+a <- NHA_DE_q0.05_fc1.5 %>% inner_join(lgg_type1_res_q0.05 %>% select(gene_ID, direction, fc), by = "gene_ID") %>% 
+  filter(direction.x == direction.y, gene_ID != "Y_RNA")
+
+b <- F8_DE_q0.05_fc1.5 %>% inner_join(lgg_type1_res_q0.05 %>% select(gene_ID, direction, fc), by = "gene_ID") %>% 
+  filter(direction.x == direction.y)
+
+c <- a %>% filter(gene_ID %in% b$gene_ID)
+
+lgg_type1_res_q0.05_CIC_target <- lgg_type1_res_q0.05 %>% 
+  filter(gene_ID %in% Weiss_G144_CIC_targets$gene_ID) %>% 
+  na.omit() %>% 
+  mutate(motif = if_else(gene_ID %in% CIC_motif_hg19_anno_promoter$gene_ID, TRUE, FALSE))
+
+NHA_lgg_type1_CIC_target <- NHA_CIC_target_DE %>% 
+  filter(gene_ID %in% lgg_type1_res_q0.05_CIC_target$gene_ID) %>% 
+  mutate(motif = if_else(gene_ID %in% CIC_motif_hg19_anno_promoter$gene_ID, TRUE, FALSE))
+
+F8_lgg_type1_CIC_target <- F8_CIC_target_DE %>% 
+  filter(gene_ID %in% lgg_type1_res_q0.05_CIC_target$gene_ID) %>% 
+  mutate(motif = if_else(gene_ID %in% CIC_motif_hg19_anno_promoter$gene_ID, TRUE, FALSE))
+
+a <- lgg_type1_res_q0.05_CIC_target %>% filter(!(gene_ID %in% NHA_DE_CIC_targets$gene_ID | gene_ID %in% F8_DE_CIC_targets$gene_ID))
+
+library(UpSetR)
+listInput <- list(one = c(1, 2, 3, 5, 7, 8, 11, 12, 13), two = c(1, 2, 4, 5, 10), three = c(1, 5, 6, 7, 8, 9, 10, 12, 13))
+
+expressionInput <- c(NHA = 7, F8 = 18, ODG = 46, `NHA&F8` = 10, `NHA&ODG` = 3, `F8&ODG` = 9, `NHA&F8&ODG` = 8)
+
+pdf(file = str_c(thesis, "CIC Putative Target Upset.pdf"), width = 7, height = 5, onefile=F)
+upset(fromExpression(expressionInput),  order.by = "freq", text.scale = 2, point.size = 5)
+dev.off()
+```
+
+```{r}
+lgg_type1_CIC_muts <- read_excel("/projects/sdlee_prj/sdlee_prj_results/thesis/data/TCGA_ODG_CIC_status.xlsx",
+                                 col_names = c("Case", "mut"), skip = 1)
+
+ETV_ensembl <- ensembl_mapper %>% 
+  filter(gene_ID %in% c("ETV1", "ETV4", "ETV5"))
+
+ETV_type1 <- type1_lgg_counts %>% 
+  as.data.frame() %>% 
+  rownames_to_column("ensembl_ID") %>% 
+  separate(ensembl_ID, c("ensembl_ID", "x"), sep = "\\.") %>%
+  left_join(ensembl_mapper) %>% 
+  filter(gene_ID %in% c("ETV1", "ETV4", "ETV5")) %>% 
+  select(-c(x, ensembl_ID)) %>% 
+  column_to_rownames("gene_ID") %>% 
+  t() %>%
+  as.data.frame() %>% 
+  rownames_to_column("file") %>% 
+  left_join(lgg_sample_sheet) %>% 
+  left_join(lgg_type1_CIC_muts)
+
+
+vl_lgg_CIC_status <- read_excel("/projects/sdlee_prj/sdlee_prj_results/thesis/data/vl_lgg_CIC_status.xlsx",
+                                 col_names = c("Case", "vl_CIC", "type", "vl_mut"), skip = 3) %>% 
+  mutate(Case = str_replace(Case,"-01", "")) %>% 
+  left_join(lgg_type1_files) %>% 
+  left_join(lgg_type1_CIC_muts)
+```
+
+
+# CIC binding sites at promoters of DE genes
+```{r}
+ensembl_tss <- getBM(attributes = c('ensembl_gene_id', 'chromosome_name', 'start_position', 'end_position', 'strand', 'transcription_start_site'),
+                     values = gene_anno$ensembl_ID, mart = grch37) %>% 
+  select(chr = chromosome_name, start = start_position, end = end_position, ensembl_ID = ensembl_gene_id, strand, tss = transcription_start_site)
+
+ensembl_tss <- read.delim(str_c(pd,"shared_objects/ensembl_mapper.tsv"), sep = '\t', header = T, stringsAsFactors = F) %>%
+  left_join(ensembl_tss) %>% 
+  select(chr, start, end, everything())
+
+mart = useMart("ensembl")
+ensembl = useDataset("hsapiens_gene_ensembl", mart = mart)
+
+
+```
+
+```{r}
+motif_dir <- "/projects/echun_prj/collaboration/CIC/chip/macs2/cic_motif/"
+
+read_bed <- function(x) {
+  df <- fread(x, col.names = c("chr", "start", "end", "sequence"))
+  return(df)
+}
+
+CIC_motif_hg19 <- str_c(motif_dir, str_subset(list.files(motif_dir), "conservative.bed")) %>% 
+  map(read_bed) %>% 
+  bind_rows()
+
+CIC_motif_hg19n <- CIC_motif_hg19 %>% mutate(chr = str_replace(chr, "chr", ""))
+
+write_tsv(CIC_motif_hg19n, "/projects/marralab_cic_prj/rna_seq/CIC_motif_hg19.bed", col_names = F)
+```
+
+```
+CIC_motif_hg19_anno.sorted.bed :
+        ${bedtools}/closestBed -D "ref" -a CIC_motif_hg19.sorted.bed -b ${pd}/tss.bed > $@
+```
+
+```{r}
+CIC_motif_hg19_anno <- fread("/projects/marralab_cic_prj/rna_seq/CIC_motif_hg19_anno.sorted.bed",
+                             col.names = c("chr", "start", "end", "motif", "x1", "tss", "x2", "gene_ID", "dist")) %>% 
+  select(-contains("x"))
+
+CIC_motif_hg19_anno_promoter <- CIC_motif_hg19_anno %>% 
+  filter(dist >= -500 & dist <= 1500)
+```
+
+## Summary of CIC targets
+```{r}
+CIC_targets <- rbind(NHA_DE_CIC_targets %>% select(gene_ID, direction, motif) %>% mutate(model = "IDH1-WT"),
+                     F8_DE_CIC_targets %>% select(gene_ID, direction, motif) %>% mutate(model = "IDH1-R132H"),
+                     lgg_type1_DE_CIC_targets %>% select(gene_ID, direction, motif) %>% mutate(model = "ODG")) %>%
+  spread(model, direction) %>% 
+  mutate(overlap = case_when(!isNA(`IDH1-WT`) & !isNA(`IDH1-R132H`) & !isNA(ODG) ~ "all",
+                             isNA(`IDH1-WT`) & !isNA(`IDH1-R132H`) & !isNA(ODG) ~ "IDH1-R132H & ODG",
+                             !isNA(`IDH1-WT`) & isNA(`IDH1-R132H`) & !isNA(ODG) ~ "IDH1-WT & ODG",
+                             !isNA(`IDH1-WT`) & !isNA(`IDH1-R132H`) & isNA(ODG) ~ "IDH1-WT & IDH1-R132H",
+                             isNA(`IDH1-WT`) & isNA(`IDH1-R132H`) & !isNA(ODG) ~ "ODG",
+                             isNA(`IDH1-WT`) & !isNA(`IDH1-R132H`) & isNA(ODG) ~ "IDH1-R132H",
+                             !isNA(`IDH1-WT`) & isNA(`IDH1-R132H`) & isNA(ODG) ~ "IDH1-WT"))
+CIC_targets[isNA(CIC_targets)] <- "none"
+
+CIC_targets <- CIC_targets %>% gather(model, direction, c(`IDH1-WT`, `IDH1-R132H`, ODG)) %>% 
+  mutate(model = factor(model, levels = c("IDH1-WT", "IDH1-R132H", "ODG")),
+         direction = factor(direction, levels = c("none", "down", "up")),
+         gene_ID = factor(gene_ID, levels = c("ETV1", "ETV4", "ETV5", "GPR3", "SHC4", "BCL2", "CDC14B", "ZSWIM4", "BACH2", "ESRRG",
+                                              "GPR98", "LRP8", "SPRED1", "SPRED3", "TRAPPC9", "MAFF", "PELI2", "ADAMTS3", "MMD", "PDE4D",
+                                              "PGAP1", 
+                                              "PYGL", "SPRY1", "VCAN", "ACAP3", "ALK", "C19orf26", "C1orf61", "C8orf86", "CIRBP", 
+                                              "DUSP4", "DUSP6", "EPHA2", "EPHB3", "ERCC2", "EVI5L", "FGFBP3", "HCRTR1", "HEXIM2",  
+                                              "MDGA2", "MIDN", "NEU4", "NEUROG2", "OLIG2", "PDE4B", "PER2", "PLK3", "PTPN9", "PTX3", 
+                                              "RGR", "SF3A1", "SPRED2", "SPRY4", "TGFB3", "TLE6", "UBALD2", "WNK3", "ZNF219", "CDC14A",
+                                              "CHD3", "EPB41", "FAM60A", "GLCCI1", "HDAC4", "IGF2BP3", "MEF2C", "MFSD2A", "OSGIN1", 
+                                              "OSTC", "PTK2", "RHEBL1", "SLCO4A1", "TPRG1", "CEP41", "CHN1", "DENND1A", 
+                                              "PPIL2", "TXK", "CIC", "TMEM108", "CNGB1", "RUNX1", "LBH", "FGFR3", "EHF",
+                                              "EIF4E", "MYCN", "TSC22D2", "ALPK2", "C2CD3", "RGS12", "KLF15", "UNC13A")))
+
+ggplot(CIC_targets, aes(model, as.factor(gene_ID) %>% fct_rev(), shape = direction, fill = direction)) +
+  geom_point(size = 4) +
+  scale_fill_manual(values = c("gray", "seagreen3", "tomato")) +
+  scale_shape_manual(values = c(18, 25, 24)) +
+  labs(y = NULL) +
+  my_theme +
+  theme(panel.grid.major.y = element_line(linetype = "dashed", color = "gainsboro"))
+
+```
+

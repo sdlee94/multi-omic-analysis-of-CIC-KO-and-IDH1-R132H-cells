@@ -1,0 +1,569 @@
+---
+title: "CIC Project: WGBS Analysis"
+author: "Stephen Lee"
+date: '`r format(Sys.time(), "%B %d, %Y")`'
+output: github_document
+---
+
+## Table of Contents
+
+----
+
+### **GSC Files**
+
+----
+
+> The GSC submission form can be found here: ```/home/sdlee/projects/CIC_prj/GSC_Submissions/Marra_GSC-1349C_Tissue-Submission_Form_06Oct2017.xls```
+
+> A file listing the full path to GSC BAM files for each library can be found here: ```/projects/marralab_cic_prj/wgbs/libs.tsv```
+
+Sample     | Passage | Library ID 
+---------- | ------- | ----------
+NHA_rep1   | 16      | A82228
+NHA_rep2   | 17      | A82231
+NHAA2_rep1 | 16      | A82230
+NHAA2_rep2 | 17      | A82233
+NHAH9_rep1 | 16      | A82229
+NHAH9_rep2 | 17      | A82232
+F8_rep1    | 16      | A82234
+F8_rep2    | 17      | A82237
+F8A2_rep1  | 16      | A82235
+F8A2_rep2  | 17      | A82238
+F8E10_rep1 | 16      | A82236
+F8E10_rep2 | 17      | A82239
+
+### **Resources**
+
+[methylKit: User Guide v1.6.0](http://bioconductor.org/packages/3.7/bioc/vignettes/methylKit/inst/doc/methylKit.html)    
+[The bsseq User’s Guide](https://bioconductor.org/packages/release/bioc/vignettes/bsseq/inst/doc/bsseq.html#4_reading_data)    
+[Analyzing WGBS data with bsseq](https://www.bioconductor.org/packages/3.7/bioc/vignettes/bsseq/inst/doc/bsseq_analysis.html#1_introduction)
+
+## **Section 1: Using Make** <a name="section1"></a>
+
+----
+
+### **Directory structure** <a name="dir"></a>
+
+```
+libs = $(shell cut -f 1 libs.tsv)
+lib_locs = $(shell cat libs.tsv | awk '{print$$1"__"$$2}')
+
+setupdir = $(foreach lib, ${libs}, $(lib)/bam)
+dir : ${setupdir}
+
+# create directory structure
+%/bam :
+       	mkdir $*; mkdir $*/bam
+
+# import gsc bam files
+get_bams = $(foreach lib_loc, ${lib_locs}, $(lib_loc)/bam/gsc.bam)
+getbams : ${get_bams}
+
+%/bam/gsc.bam :
+        lib=$$(echo $* | awk '{ gsub("__.*", ""); print }'); \
+        loc=$$(echo $* | awk '{ gsub(".*__", ""); print }'); \
+        ln -s $${loc} $${lib}/bam/gsc.bam
+```
+
+### **Processing BAM files** <a name="bams"></a>
+
+Here, we obtain general information on each BAM file using *samtools flagstat* which will be used for intial QC purposes. We also filter out unmapped reads, sort and index the BAM files to generate our own hard copy.
+
+```
+filter_sort = $(foreach lib, ${libs}, $(lib)/bam/gsc.sorted.bam)
+flagstats = $(foreach lib, ${libs}, $(lib)/bam/flagstat.txt)
+
+sortbams : ${filter_sort}
+flags : ${flagstats}
+
+# sort and index
+%/bam/gsc.sorted.bam :
+        samtools sort $*/bam/gsc.bam $*/bam/gsc.sorted; \
+        samtools index $*/bam/gsc.sorted.bam \
+        $*/bam/gsc.sorted.bam.bai
+
+# flagstat
+%/bam/flagstat.txt :
+        samtools flagstat $*/bam/gsc.bam > $@
+```
+
+### **Obtain coverage of unmethylated/methylated C's using Novo5mC** <a name="novo"></a>
+
+*This script was written by Elizabeth Chun.* Using Misha Bilenky's Novo5mC we obtain the coverage of all CpGs on autosomes and XY chromosomes and calculate fractional methylation with the formula: coverage C (methylated C) / coverage C + coverage T (unmethylated C). A value of 0 would indicate an unmethylated CpG while a value of 1 would indicate a methylated CpG. We can also obtain this information in other C contexts such as CHH and CHG sites.
+
+```
+HSA_GENOME_FILE = /home/pubseq/genomes/Homo_sapiens/hg19a/bwa_ind/genome/GRCh37-lite.fa
+LIB_DIRS = $(shell cat /projects/marralab_cic_prj/wgbs/dir.txt)
+
+# Run Novo5mC: No coverage threshold. Run it for CpG, CHH, and CHG.
+run_novo5mc = $(foreach dir, ${LIB_DIRS}, $(dir)/novo5mC/gsc.q5.5mC.CpG.gz)
+runNovo5mc: $(run_novo5mc)
+%/novo5mC/gsc.q5.5mC.CpG.gz : %/bam/gsc.bam
+        /gsc/software/linux-x86_64/jre1.8.0_66/bin/java -jar -Xmx32G /home/mbilenky/bin/Solexa_Java/Novo5mC.jar -bam $< -out $*/novo5mC/ -genome ${HSA_GENOME_FILE} -gz -nonCpG > $*/novo5mC/novo5mC_log.txt$
+
+# Get CpGs on autosomes and XY chromosomes.
+get_autochr = $(foreach dir, ${LIB_DIRS}, $(dir)/novo5mC/gsc.q5.5mC.CpG.autoChrXY)
+getAutochr: $(get_autochr)
+%/novo5mC/gsc.q5.5mC.CpG.autoChrXY : %/novo5mC/gsc.q5.5mC.CpG.gz
+        zcat $< | grep -v '^GL' | grep -v '^MT' > $@
+
+# Summarize the coverages for CpGs on autosomes and XY chromosomes.
+sum_cov = $(foreach dir, ${LIB_DIRS}, $(dir)/novo5mC/gsc.q5.5mC.CpG.autoChrXY.sum_cpg)
+sumCov: $(sum_cov)
+%/novo5mC/gsc.q5.5mC.CpG.autoChrXY.sum_cpg : %/novo5mC/gsc.q5.5mC.CpG.autoChrXY
+        cat $< | awk 'BEGIN{p=-1; v1=0; v2=0; v3=0} {if(p==($$2-1)){print $$1"\t"p"\t*\t"$$4+v1"\t"$$5+v2"\t"v3; p=-1} else{p=$$2; v1=$$4; v2=$$5; v3=$$6}}END{}' > $@
+
+# Calculate methylation percentage for each C and G with at least 1 read coverage
+calculate_meth = $(foreach dir, ${LIB_DIRS}, $(dir)/novo5mC/gsc.q5.5mC.CpG.autoChrXY.sum_cpg.quant)
+calculateMeth: $(calculate_meth)
+%/novo5mC/gsc.q5.5mC.CpG.autoChrXY.sum_cpg.quant : %/novo5mC/gsc.q5.5mC.CpG.autoChrXY.sum_cpg
+        cat $< | awk '{if($$4+$$5>0) print $$0"\t"$$5/($$4+$$5)}' > $@
+```
+
+## **Section 2: QC** <a name="section2"></a>
+
+----
+
+### **load librarires**  <a name="setup"></a>
+```{r, message=FALSE}
+library(tidyverse)
+library(stringr)
+library(data.table)
+library(cowplot)
+library(knitr)
+
+wd <- "/projects/marralab_cic_prj/wgbs/"
+figs_path <-  "/projects/sdlee_prj/sdlee/reports/QC/figs/WGBS/"
+bed_cols <- c("chr", "start", "end")
+```
+
+#### **Sequencing Metrics** <a name="metrics"></a>
+
+Here, we look at the amount of reads and proportion of reads mapped in each library to guage their quality.
+
+```
+read_flagstats <- function(flagstats) {
+	files <- read.delim(flagstats, sep = '\t', header = F, stringsAsFactors = F) %>% 
+		mutate(lib = str_subset(str_split(flagstats, "/", simplify = T), "rep")) %>% 
+		group_by(lib) %>% 
+		mutate(total = as.integer(str_replace(nth(V1, 1), " .*", "")),
+					 mapped = as.integer(str_replace(nth(V1, 3), " .*", "")),
+					 perc = as.numeric(str_replace(str_replace(nth(V1, 3), ".* \\(", ""), "%:.*", "")),
+					 qc_fail = as.integer(str_replace(str_replace(nth(V1, 1), ".*[0-9] [+] ", ""), " in.*", "")),
+					 dupe = as.integer(str_replace(nth(V1, 2), " .*", ""))) %>% 
+		dplyr::select(-V1) %>% 
+		unique() %>%
+		rowwise() %>%
+		mutate(dupe_perc = dupe / mapped * 100) %>% 
+		separate(lib, c("cell_line", "rep"), sep = "_")
+	
+	return(files)
+}	
+
+wgbs_flagstats <- str_subset(dir(), "rep") %>% 
+	str_c("/bam/flagstat.txt") %>% 
+	purrr::map(read_flagstats) %>% 
+	bind_rows()
+
+wgbs_flagstats$cell_line <- as.factor(wgbs_flagstats$cell_line)
+wgbs_flagstats$rep <- as.factor(wgbs_flagstats$rep)
+
+saveRDS(wgbs_flagstats, "R_objects/wgbs_flagstats.rds")
+```
+
+```
+wgbs_flagstats <- readRDS("/projects/marralab_cic_prj/wgbs/R_objects/wgbs_flagstats.rds")
+
+total_read_p <- ggplot(wgbs_flagstats, aes(cell_line, total, fill = rep)) +
+	geom_col(position = "dodge") +
+	labs(x = "Cell Line", y = "Total Reads", fill = "Rep")
+
+perc_mapped_p <- ggplot(wgbs_flagstats, aes(cell_line, perc, fill = rep)) +
+	geom_col(position = "dodge") +
+	labs(x = "Cell Line", y = "% Mapped Reads", fill = "Rep")
+
+pdf(file = str_c(figs_path, "flagstats.pdf"), width = 10)
+p <- plot_grid(total_read_p, perc_mapped_p, nrow = 2)
+p
+save_plot(str_c(figs_path, "flagstats.png"), p, base_height = 10, base_width = 15)
+dev.off()
+```
+<center><img src="/projects/sdlee_prj/sdlee/reports/QC/figs/WGBS/flagstats.png">
+
+### **Import Novo5mC Output** <a name="import"></a>
+
+```
+read_novo <- function(novo){
+	files <- fread(novo, sep = '\t', header = F, stringsAsFactors = F, col.names = c("chr", "pos", "strand", "cov_T", "cov_C", "seq")) %>% 
+		dplyr::select(-strand, -seq) %>% 
+		mutate(cov = cov_T + cov_C, fme = cov_C / cov, lib = str_subset(str_split(novo, "/", simplify = T), "rep"))
+	
+	return(files)
+}
+
+all_cpg <- str_subset(dir(), "rep") %>% 
+	str_c("/novo5mC/gsc.q5.5mC.CpG.autoChrXY.sum_cpg") %>% 
+	purrr::map(read_novo) %>% 
+	bind_rows()
+
+all_cpg$chr <- factor(all_cpg$chr, levels = c(1:22, "X", "Y"))
+all_cpg$lib <- as.factor(all_cpg$lib)
+
+saveRDS(all_cpg, "R_objects/all_cpg.rds")
+
+no_cov_cpg_summary <- all_cpg %>% 
+  filter(cov == 0) %>% 
+  group_by(lib) %>% 
+  summarize(n = n())
+  
+saveRDS(no_cov_cpg_summary, "R_objects/no_cov_cpg_summary.rds")
+```
+
+```{r}
+no_cov_cpg_summary <- readRDS(str_c(wd, "R_objects/no_cov_cpg_summary.rds"))
+kable(no_cov_cpg_summary)
+```
+
+> An average of `r round(mean(no_cov_cpg_summary$n), 2)` CpGs have 0 coverage
+
+```
+all_cpg_c5 <- all_cpg_covered %>% 
+	filter(cov >= 5)
+
+saveRDS(all_cpg_c5, "R_objects/all_cpg_c5.rds")
+all_cpg_c5 <- readRDS("/projects/marralab_cic_prj/wgbs/R_objects/all_cpg_c5.rds")
+```
+
+all_cpg_c5_mat <- readRDS("/projects/marralab_cic_prj/wgbs/R_objects/all_cpg_c5_mat.rds")
+all_cpg_c5_granges <- all_cpg_c5_mat %>%
+  as.data.frame() %>% 
+  rownames_to_column("id") %>% 
+  separate(id, c("chr", "start"), sep = ":") %>% 
+  mutate(start = as.integer(start),
+         end = start + 1,
+         chr = str_c("chr", chr)) %>% 
+  makeGRangesFromDataFrame(keep.extra.columns = T)
+saveRDS(all_cpg_c5_granges, "/projects/marralab_cic_prj/wgbs/R_objects/all_cpg_c5_granges.rds")
+all_cpg_c5_granges <- readRDS("/projects/marralab_cic_prj/wgbs/R_objects/all_cpg_c5_granges.rds")
+
+
+
+```{r}
+# make bed files for all CpGs in all samples with a coverage of at least 5x
+all_cpg_c5_mat <- all_cpg_c5 %>% 
+	unite(chr, pos, col = "id", sep = ":") %>% 
+	select(id, fme, lib) %>% 
+	spread(lib, fme) %>% 
+	column_to_rownames("id") %>% 
+	as.matrix()
+
+all_cpg_c5_granges <- all_cpg_c5_mat %>%
+  as.data.frame() %>% 
+  rownames_to_column("id") %>% 
+  separate(id, c("chr", "start"), sep = ":") %>% 
+  mutate(start = as.integer(start),
+         end = start + 1,
+         chr = str_c("chr", chr)) %>% 
+  makeGRangesFromDataFrame(keep.extra.columns = T)
+saveRDS(all_cpg_c5_granges, "/projects/marralab_cic_prj/wgbs/R_objects/all_cpg_c5_granges.rds")
+all_cpg_c5_granges <- readRDS("/projects/marralab_cic_prj/wgbs/R_objects/all_cpg_c5_granges.rds")
+
+samples <- str_c(rep(c("NHA", "NHAA2", "NHAH9", "F8", "F8A2", "F8E10"), each = 2), c("_rep1", "_rep2"))
+
+make_cpg_c5_bed <- function(x) {
+  df <- all_cpg_c5_granges %>% 
+    as.data.frame() %>%
+    # Since some CpGs have <5 coverage in some samples and not others, some CpGs will have NA values
+    select(chr = seqnames, start, end, x) %>% 
+    na.omit()
+  
+  write_tsv(df, str_c(wd, x, "/novo5mC/cpg_c5.bed"), col_names = F)
+}
+
+samples %>% map(make_cpg_c5_bed)
+
+```
+
+
+
+### **CpG Methylation Across Genomic Features** 
+
+
+CpG Islands and shores
+```{r}
+bed_cols <- c("chr", "start", "end")
+cpg_island_import <- read.delim(str_c(wd, "cpgIslandExt.txt"), header = F, 
+                                col.names = c(bed_cols, "name", "length", "num_CpG", "num_C_and_G", "perc_CpG", "perc_C_and_G", "OE_ratio"))
+
+# Remove any CpGs not in canonical chromosomes 
+cpg_islands <- cpg_island_import %>% 
+	filter(chr %in% str_c("chr", c(1:22, "X", "Y"))) %>% 
+	droplevels() %>% 
+  arrange(chr, start)
+
+write_tsv(cpg_islands %>% select(bed_cols), str_c(wd, "ref_data/cpg_islands.bed"), col_names = F)
+
+library(genomation)
+hg19_cpg_obj = readFeatureFlank("/projects/marralab_cic_prj/wgbs/cpgIslandExt.txt", flank = 2000,
+                                feature.flank.name = c("CpGi","shores"))
+
+hg19_cpg_islands <- hg19_cpg_obj$CpGi %>% 
+  as.data.frame() %>% 
+	filter(seqnames %in% str_c("chr", c(1:22, "X", "Y"))) %>% 
+	droplevels() %>% 
+  select(chr = seqnames, everything()) %>% 
+  arrange(chr, start)
+
+write_tsv(hg19_cpg_islands %>% select(bed_cols), str_c(wd, "ref_data/cpg_islands.bed"), col_names = F)
+
+hg19_cpg_shores <- hg19_cpg_obj$shores %>% 
+  as.data.frame() %>% 
+	filter(seqnames %in% str_c("chr", c(1:22, "X", "Y"))) %>% 
+	droplevels() %>% 
+  select(chr = seqnames, everything()) %>% 
+  mutate()
+  arrange(chr, start)
+
+write_tsv(hg19_cpg_shores %>% select(bed_cols), str_c(wd, "ref_data/cpg_shores.bed"), col_names = F)
+```
+
+# TSS 1500 and 200
+```{r}
+# function to calculate the sum of all exons
+# used to determine the 'canonical' transcript with the longest cds
+get_exon_sum <- function(exon_starts, exon_ends){
+  # the purpose of the str_sub is to trim off the last ',' in exonStarts/Ends
+  starts <- as.numeric(unlist(str_split(str_sub(exon_starts, 1, -2), pattern = ",")))
+  ends <- as.numeric(unlist(str_split(str_sub(exon_ends, 1, -2), pattern = ",")))
+  exon_sum <- sum(ends - starts)
+  
+  return(exon_sum)
+}
+
+hg19_refseq <- fread("/projects/marralab_cic_prj/shared_objects/Homo_sapiens_hg19_refseq.bed", header = T) %>% 
+  select(transcript_ID = name, chr = chrom, strand, txStart, txEnd, 
+         cdsStart, cdsEnd, exonStarts, exonEnds, gene_name = name2) %>% 
+  rowwise() %>% 
+  mutate(exon_sum = get_exon_sum(exonStarts, exonEnds))
+
+# we use the transcript with the longest cds (largest exon sum) as the 'canonical'
+# the concept of a canonical transcript is rather subjective and biologically unrealistic*
+hg19_refseq_canonical <- hg19_refseq %>% 
+  group_by(gene_name) %>% 
+  filter(exon_sum == max(exon_sum), chr %in% str_c("chr", c(1:22, "X", "Y")))
+
+# TSS1500 = 1500 to 200 bases upstream of TSS while TSS200 = 200 bp up to the TSS
+# note that txEnd is the TSS for genes on the minus strand
+hg19_refseq_canonical_tss <- hg19_refseq_canonical %>% 
+  mutate(tss1500_start = if_else(strand == "+", as.integer(txStart - 1500), as.integer(txEnd + 200)),
+         tss1500_end = if_else(strand == "+", as.integer(txStart - 200), as.integer(txEnd + 1500)),
+         tss200_start = if_else(strand == "+", as.integer(txStart - 200), as.integer(txEnd)),
+         tss200_end = if_else(strand == "+", as.integer(txStart), as.integer(txEnd + 200)))
+
+write_tsv(hg19_refseq_canonical_tss %>% select(chr, tss1500_start, tss1500_end, gene_name), 
+          str_c(wd, "ref_data/refseq_tss_1500.bed"), col_names = F)
+
+write_tsv(hg19_refseq_canonical_tss %>% select(chr, tss200_start, tss200_end, gene_name), 
+          str_c(wd, "ref_data/refseq_tss_200.bed"), col_names = F)
+```
+
+#5' UTR, gene body and 3' UTR
+```{r}
+hg19_refseq_gene <- hg19_refseq_canonical %>%
+  mutate(`5'UTR_start` = if_else(strand == "+", as.integer(txStart + 1), as.integer(cdsEnd + 1)),
+         `5'UTR_end` = if_else(strand == "+", as.integer(cdsStart), as.integer(txEnd)),
+         body_start = if_else(strand == "+", as.integer(cdsStart + 1), as.integer(cdsStart + 1)),
+         body_end = if_else(strand == "+", as.integer(cdsEnd), as.integer(cdsEnd)),
+         `3'UTR_start` = if_else(strand == "+", as.integer(cdsEnd + 1), as.integer(txStart)),
+         `3'UTR_end` = if_else(strand == "+", as.integer(txEnd), as.integer(cdsStart))) %>% 
+  # filter out non-coding transcripts
+  filter(cdsStart != cdsEnd)
+
+# Some genes lack UTRs, filter them out when writing respective utr bed files
+write_tsv(hg19_refseq_gene %>% 
+            filter(txStart != cdsStart, txEnd != cdsEnd) %>% 
+            select(chr, `5'UTR_start`, `5'UTR_end`, gene_name), 
+          str_c(wd, "ref_data/refseq_5_utr.bed"), col_names = F)
+
+write_tsv(hg19_refseq_gene %>% select(chr, body_start, body_end, gene_name), 
+          str_c(wd, "ref_data/refseq_gene_body.bed"), col_names = F)
+
+write_tsv(hg19_refseq_gene %>% 
+            filter(txStart != cdsStart, txEnd != cdsEnd) %>%
+            select(chr, `3'UTR_start`, `3'UTR_end`, gene_name), 
+          str_c(wd, "ref_data/refseq_3_utr.bed"), col_names = F)
+```
+
+# plot cpg methylation across genomic features
+```{r}
+library(plyr)
+bed_cols <- c("chr", "start", "end")
+
+read_cpg_mean <- function(x) {
+  feature <- str_replace(x, "/.*", "")
+  sample <- str_replace(x, ".*/", "") %>% 
+    str_replace(".mean_cpg.bed", "")
+  
+  if(feature %in% c("CpG_islands", "CpG_shores", "intergenic")) {
+    df <- fread(str_c("/projects/marralab_cic_prj/wgbs/genomic_features/", x),
+                col.names = c(bed_cols, "fme")) %>% 
+      mutate(feature = feature, sample = sample, gene_name = NA)
+  } else {
+    df <- fread(str_c("/projects/marralab_cic_prj/wgbs/genomic_features/", x),
+                col.names = c(bed_cols, "gene_name", "fme")) %>% 
+      mutate(feature = feature, sample = sample)
+  }
+  
+  return(df)
+}
+
+# data frame containing mean fractional methylation at each genomic feature in all samples
+all_cpg_c5_gfeatures <- list.files("/projects/marralab_cic_prj/wgbs/genomic_features/", recursive = T) %>% 
+  map(read_cpg_mean) %>% 
+  rbind.fill() %>% 
+  separate(sample, c("cell_line", "rep")) %>% 
+  mutate(CIC = case_when(cell_line %in% c("F8", "NHA") ~ "CIC-WT",
+                           cell_line %in% c("NHAA2", "F8A2") ~ "CIC-KO1",
+                           cell_line %in% c("NHAH9", "F8E10") ~ "CIC-KO2"),
+         IDH1 = if_else(cell_line %like% "NHA", "IDH1-WT", "IDH1-R132H")) %>% 
+  filter(fme != ".") %>% 
+  mutate(fme = as.numeric(fme),
+         CIC = factor(CIC, levels = c("CIC-WT", "CIC-KO1", "CIC-KO2")),
+         IDH1 = as.factor(IDH1) %>% fct_rev())
+
+ggplot(all_cpg_c5_gfeatures, aes(IDH1, fme, fill = CIC)) +
+  geom_boxplot() +
+    scale_fill_manual(values = c("dodgerblue3", "aliceblue", "lightcyan")) +
+    scale_x_discrete(labels = c("IDH1\nWT", "IDH1\nR132H")) +
+  facet_wrap(~feature)
+
+ggplot(df, aes(IDH1, fc, fill = CIC)) +
+    geom_boxplot() +
+    scale_fill_manual(values = c("dodgerblue3", "aliceblue", "lightcyan")) +
+    scale_x_discrete(labels = c("IDH1\nWT", "IDH1\nR132H")) +
+    labs(x = NULL, y = "Fold change RPKM\n(Relative to CIC & IDH1-WT)", fill = NULL) +
+    facet_wrap(~gene_ID, scales = "free") +
+    my_theme +
+    theme(legend.position = "bottom",
+          strip.background = element_rect(fill = "white", color = "white"),
+          strip.text = element_text(colour = "black", face = "bold", size = 16),
+          strip.placement = "outside",
+          panel.grid.major = element_line(linetype = "dashed", color = "gainsboro"),
+          panel.spacing = unit(2, "lines"))
+
+
+```
+
+
+# Do IDH1-R132H expressing cells exhibit the CpG island hypermethylator phenotype (CIMP)?
+```{r}
+wd <- "/projects/marralab_cic_prj/wgbs/"
+all_cpg_c10_mat <- readRDS(str_c(wd, "R_objects/all_cpg_c10_mat.rds")) %>% as.matrix()
+
+cpg_select <- head(order(-rowVars(all_cpg_c10_mat)), 10000)
+
+anno_df <- data.frame(CIC = rep(c(rep("WT", 2), rep("KO", 4)), 2), IDH1 = c(rep("R132H", 6), rep("WT", 6)))
+rownames(anno_df) <- colnames(all_cpg_c10_mat)
+
+anno_colors = list(CIC = c("firebrick1", "dodgerblue1"), IDH1 = c("forestgreen", "darkorange"))
+names(anno_colors$CIC) <- unique(anno_df$CIC)
+names(anno_colors$IDH1) <- unique(anno_df$IDH1)
+
+top_10000_variable_cpgs <- all_cpg_c10_mat[cpg_select,]
+
+pdf(file = str_c(wd, "figures/qc/top_10000_variable_cpgs.pdf"))
+pheatmap(top_10000_variable_cpgs, cluster_rows = T, cluster_cols = F, show_rownames = F, show_colnames = F, col = colorRampPalette(c("royalblue3", "white", "gold"))(100),
+				 annotation_col = anno_df, annotation_colors = anno_colors) + theme_1
+dev.off()
+
+ggsave(str_c(wd, "figures/qc/top_10000_variable_cpgs.pdf"), 
+       pheatmap(top_10000_variable_cpgs, cluster_rows = T, cluster_cols = F, show_rownames = F, show_colnames = F, col = colorRampPalette(c("royalblue3", "white", "gold"))(100),
+                annotation_col = anno_df, annotation_colors = anno_colors) + theme_1)
+ggsave(str_c(wd, "figures/qc/top_10000_variable_cpgs.png"), 
+       pheatmap(top_10000_variable_cpgs, cluster_rows = T, cluster_cols = F, show_rownames = F, show_colnames = F, col = colorRampPalette(c("royalblue3", "white", "gold"))(100),
+                annotation_col = anno_df, annotation_colors = anno_colors) + theme_1)
+
+all_cpg_c5_cpgi <- all_cpg_c5_gfeatures %>% 
+  filter(feature == "CpG_islands") %>% 
+  unite(sample, c("cell_line", "rep"), sep = "_")
+
+ordered_samples <- str_c(rep(c("NHA", "NHAA2", "NHAH9", "F8", "F8A2", "F8E10"), each = 2), c("_rep1", "_rep2"))
+
+all_cpg_c5_cpgi_mat <- all_cpg_c5_cpgi %>% 
+  select(-c(gene_name, feature, CIC, IDH1)) %>% 
+  unite(id, bed_cols, sep = ":") %>% 
+  spread(sample, fme) %>% 
+  column_to_rownames("id") %>% 
+  select(ordered_samples) %>% 
+  na.omit()
+
+library(pheatmap)
+
+anno_df <- data.frame(CIC = rep(c(rep("WT", 2), rep("KO", 4)), 2), IDH1 = c(rep("WT", 6), rep("R132H", 6)))
+rownames(anno_df) <- ordered_samples
+
+anno_colors = list(CIC = c("firebrick1", "dodgerblue1"), IDH1 = c("forestgreen", "darkorange"))
+names(anno_colors$CIC) <- unique(anno_df$CIC)
+names(anno_colors$IDH1) <- unique(anno_df$IDH1)
+
+pheatmap(all_cpg_c5_cpgi_mat, cluster_rows = T, cluster_cols = F, show_rownames = F,
+				 annotation_col = anno_df, annotation_colors = anno_colors)
+
+
+all_cpg_c5_tss_mat <- all_cpg_c5_gfeatures %>% 
+  filter(feature %like% "tss") %>% 
+  unite(sample, c("cell_line", "rep"), sep = "_") %>% 
+  select(-c(gene_name, feature, CIC, IDH1)) %>% 
+  unite(id, bed_cols, sep = ":") %>%
+  unique() %>% 
+  spread(sample, fme) %>% 
+  column_to_rownames("id") %>% 
+  select(ordered_samples) %>% 
+  na.omit()
+
+library(matrixStats)
+cpg_select <- head(order(-rowVars(all_cpg_c5_tss_mat %>% as.matrix())), 10000)
+
+pheatmap(all_cpg_c5_tss_mat[cpg_select, ], cluster_rows = T, cluster_cols = F, show_rownames = F,
+				 annotation_col = anno_df, annotation_colors = anno_colors)
+
+all_cpg_c10 <- readRDS("/projects/marralab_cic_prj/wgbs/R_objects/all_cpg_c10.rds")
+
+all_cpg_c10_mat <- all_cpg_c10 %>% 
+  select(chr, pos, lib, fme) %>% 
+  unite(coord, c("chr", "pos"), sep = ":") %>% 
+  spread(lib, fme) %>% 
+  column_to_rownames("coord") %>% 
+  select(ordered_samples) %>% 
+  na.omit()
+
+saveRDS(all_cpg_c10_mat, "/projects/marralab_cic_prj/wgbs/R_objects/all_cpg_c10_mat.rds")
+
+IDH1_DM_cpgs_q0.01_d25
+
+all_cpg_c10_mat_IDH1_DM <- all_cpg_c10_mat %>% 
+  rownames_to_column("coord") %>% 
+  left_join(IDH1_DM_cpgs_q0.01_d25 %>% select(coord, qvalue)) %>% na.omit()
+
+all_cpg_c10_mat_IDH1_DM_top10000 <- head(order(all_cpg_c10_mat_IDH1_DM$qvalue), 10000) 
+all_cpg_c10_mat_IDH1_DM_top10000  <- all_cpg_c10_mat_IDH1_DM[all_cpg_c10_mat_IDH1_DM_top10000, ] %>% 
+  select(-c(coord, qvalue)) %>% as.matrix()
+
+pheatmap(all_cpg_c10_mat_IDH1_DM_top10000, cluster_rows = T, cluster_cols = F, show_rownames = F, show_colnames = F, col = colorRampPalette(c("royalblue3", "white", "gold"))(100),
+				 annotation_col = anno_df, annotation_colors = anno_colors) + theme_1
+```
+
+# intergenic regions
+```{r}
+features_granges <- all_cpg_c5_gfeatures %>%
+  unite(id, c("chr", "start"), sep = ":") %>% 
+  select(id) %>% 
+  unique() %>% 
+  separate(id, c("chr", "start"), sep = ":") %>% 
+  mutate(end = as.integer(start) + 1)
+features_granges <- features_granges %>% 
+  makeGRangesFromDataFrame()
+
+cpg_in_features_granges <- subsetByOverlaps(all_cpg_c5_granges, features_granges)
+```
+

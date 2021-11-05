@@ -1,0 +1,1748 @@
+---
+title: "CIC Project: CIC ChIP-seq Analysis"
+author: "Stephen Lee"
+date: '`r format(Sys.time(), "%B %d, %Y")`'
+output: github_document
+---
+
+https://www.ebi.ac.uk/arrayexpress/experiments/E-MTAB-6682/samples/?s_page=1&s_pagesize=25
+
+```{r}
+figs_path <- "/projects/sdlee_prj/sdlee/reports/Analyses/figs/CIC_ChIP/"
+wd <- "/projects/marralab_cic_prj/tf_first_analysis/"
+wd2 <- "/projects/marralab_cic_prj/cic_chip/"
+
+library(tidyverse)
+library(data.table)
+select <- dplyr::select
+```
+
+```{r}
+bed_cols <- c("chr", "start", "end")
+
+anno_peaks <- function(x) {
+  require(ChIPseeker)
+  require(TxDb.Hsapiens.UCSC.hg19.knownGene)
+  txdb <- TxDb.Hsapiens.UCSC.hg19.knownGene
+  
+  if(str_detect(x$chr, "chr") == F) {
+    x <- x %>% mutate(chr = str_c("chr", chr))
+  }
+  
+  df <- x %>%
+    makeGRangesFromDataFrame(keep.extra.columns = T) %>%
+    annotatePeak(tssRegion = c(-1500, 500), TxDb = txdb, annoDb = "org.Hs.eg.db") %>% 
+    as.data.frame() %>% 
+    mutate(annotation = str_replace(annotation, " \\(.*\\)", ""),
+           annotation = if_else(annotation == "Downstream", "Distal Intergenic", annotation),
+           annotation = as.factor(annotation),
+           geneStrand = if_else(geneStrand == 1, "+", "-"),
+           seqnames = factor(seqnames, levels = str_c("chr", c(1:22, "X", "Y")))) %>% 
+    select(chr = seqnames, everything())
+  
+  return(df)
+}
+
+rep2_mfpeaks <- fread("/projects/marralab_cic_prj/tf_first_analysis/A77581/peaks/cons_peaks.bed",
+                      col.names = c(bed_cols, "X1", "X2", "X3", "fold_change", "X4", "log10_qval", 
+                                    "X5", "X6", "X7", "X8", "X9", "overlap")) %>% 
+  select(-contains("X")) %>%
+  distinct() %>% 
+  filter(chr %in% c(1:22, "X", "Y"))
+
+ggplot(rep2_mfpeaks, aes(log10_qval)) +
+  geom_density()
+
+  unite(coord, bed_cols, sep = "_") %>% 
+  group_by(coord) %>% 
+  summarize(fold_change = first(fold_change),
+            log10_qval = first(log10_qval),
+            overlap = sum(overlap)) %>% 
+  separate(coord, bed_cols, sep = "_", remove = F) %>% 
+  anno_peaks() %>% 
+  mutate(class = if_else(abs(distanceToTSS) <= 2000, "proximal", "distal"))
+
+rep2_mfpeaks_proximal <- rep2_mfpeaks %>% filter(class == "proximal")
+
+write_tsv(rep2_mfpeaks_proximal %>% select(SYMBOL) %>% unique(), "/projects/marralab_cic_prj/tf_first_analysis/CIC_targets/proximal.txt",
+          col_names = F)
+```
+
+```{r}
+vl_sc_cnv_NHA <- readRDS("/projects/marralab_cic_prj/shared_objects/nha_wt_gscores_segs.rds")
+
+get_genes_in_granges <- function(x) {
+  gene_mapper <- as.data.frame(org.Hs.egSYMBOL)
+  
+  genes <- subsetByOverlaps(genes(TxDb.Hsapiens.UCSC.hg19.knownGene), x) %>% 
+    as.data.frame() %>% 
+    left_join(gene_mapper) %>% 
+    select(chr = seqnames, gene_ID = symbol, everything())
+
+  return(genes)    
+}
+  
+NHAA2_gain <- vl_sc_cnv_NHA$A2$gain_unique %>% makeGRangesFromDataFrame()
+NHAA2_loss <- vl_sc_cnv_NHA$A2$loss_unique %>% makeGRangesFromDataFrame()
+NHAH9_gain <- vl_sc_cnv_NHA$H9$gain_unique %>% makeGRangesFromDataFrame()
+NHAH9_loss <- vl_sc_cnv_NHA$H9$loss_unique %>% makeGRangesFromDataFrame()
+
+NHAA2_gain_genes <- get_genes_in_granges(NHAA2_gain)
+NHAA2_loss_genes <- get_genes_in_granges(NHAA2_loss)
+NHAH9_gain_genes <- get_genes_in_granges(NHAH9_gain)
+NHAH9_loss_genes <- get_genes_in_granges(NHAH9_loss)
+
+NHA_cnv_genes <- rbind(NHAA2_gain_genes %>% mutate(cell_line = "A2", status = "gain"),
+                       NHAA2_loss_genes %>% mutate(cell_line = "A2", status = "loss"),
+                       NHAH9_gain_genes %>% mutate(cell_line = "H9", status = "gain"),
+                       NHAH9_loss_genes %>% mutate(cell_line = "H9", status = "loss"))
+
+saveRDS(NHA_cnv_genes, "/projects/sdlee_prj/sdlee_prj_results/thesis/data/R_objects/NHA_cnv_genes.rds")
+
+volcano_plot2 <- function(df, q_value) {
+	p <- ggplot(df, aes(mean_log2_fc, -mean_log10_padj, label = gene_ID)) +
+		geom_point(data = subset(df, mean_padj >= q_value | abs(mean_fc <= 1.5)), size = 1.5, col = "grey", alpha = 0.5) +
+		geom_point(data = subset(df, mean_padj < q_value & mean_fc > 1.5), size = 1.5, col = "tomato", alpha = 0.7) +
+		geom_point(data = subset(df, mean_padj < q_value & mean_fc < -1.5), size = 1.5, col = "seagreen3", alpha = 0.7) +
+		geom_point(data = subset(df, gene_ID %in% pos_genes), size = 2, alpha = 0.8) +
+		geom_text_repel(data = subset(df, gene_ID %in% pos_genes), aes(label = gene_ID), 
+										size = 4, fontface = "bold") +
+		geom_vline(xintercept = -log2(1.5), linetype = "dotted") +
+		geom_vline(xintercept = log2(1.5), linetype = "dotted") +
+		geom_hline(yintercept = -log10(q_value), linetype = "dotted") +
+		labs(x = "Average Log2 Fold Change", y = "Average -Log10 Adjusted P-Value") +
+		theme(legend.position = "none",
+					axis.title = element_text(size = 15, face = "bold"),
+					axis.text = element_text(size = 14),
+					panel.grid.major = element_blank(), 
+					panel.grid.minor = element_blank(),
+          panel.background = element_blank(),
+					axis.line = element_line(colour = "black"))
+	
+	return(p)
+}
+
+
+
+```
+
+Based on the QC analyses, we found that our CIC-ChIP replicates (sonicated) were highly discordant, with the second replicate displaying superior quality in terms of ChIP signal and lower noise in the input. Due to the poor quality of the first replicate, it is uncertain whether including it in our downstream analyses will help or hurt our interpretations. Secondly, FindER and MACS2 yielded very different peak results, probably due to differences in how each caller handles noisy input (MACS2 assumes normal distribution for background while FindER does not). Based on IP vs input coverage profiles, peaks called by MACS2 had better signal to noise ratio overall. Hence, I opted to just include the MACS2 peaks from the second replicate with the addition of published CIC ChIP-seq data (Weismann et al, 2018) to represent 'high' confidence CIC binding sites. 
+
+```
+./A77581/peaks/mq0.01_cov.npz :
+        ${deeptools}/multiBigwigSummary BED-file -p 40 \
+        -b ./A77581/bam/gsc.sorted.rpkm.bw ./A77582/bam/gsc.sorted.rpkm.bw \
+        --BED ./A77581/peaks/macs2_q0.01_peaks.narrowPeak \
+        --labels NHA_rep2_chip NHA_rep2_input \
+        --outRawCounts ./A77581/peaks/mq0.01_cov.tab \
+        -o $@
+```
+
+```{r}
+anno_peaks <- function(x) {
+  require(ChIPseeker)
+  require(TxDb.Hsapiens.UCSC.hg19.knownGene)
+  txdb <- TxDb.Hsapiens.UCSC.hg19.knownGene
+  
+  if(str_detect(x$chr, "chr") == F) {
+    x <- x %>% mutate(chr = str_c("chr", chr))
+  }
+  
+  df <- x %>%
+    makeGRangesFromDataFrame(keep.extra.columns = T) %>%
+    annotatePeak(tssRegion = c(-1500, 500), TxDb = txdb, annoDb = "org.Hs.eg.db") %>% 
+    as.data.frame() %>% 
+    mutate(annotation = str_replace(annotation, " \\(.*\\)", ""),
+           annotation = if_else(annotation == "Downstream", "Distal Intergenic", annotation),
+           annotation = as.factor(annotation),
+           geneStrand = if_else(geneStrand == 1, "+", "-"),
+           seqnames = factor(seqnames, levels = str_c("chr", c(1:22, "X", "Y")))) %>% 
+    select(chr = seqnames, everything())
+  
+  return(df)
+}
+
+mq0.01_peaks_rep2_cov <- fread("/projects/marralab_cic_prj/tf_first_analysis/A77581/peaks/mq0.01_cov.tab", skip = 1,
+                               col.names = c("chr", "start", "end", "ip_rpkm", "input_rpkm")) %>% 
+  unite(id, c("chr", "start", "end"))
+
+mq0.01_peaks_rep2 <- fread("/projects/marralab_cic_prj/tf_first_analysis/A77581/peaks/macs2_q0.01_peaks.narrowPeak",
+                           col.names = c("chr", "start", "end", "X1", "X2", "X3", "fold_change", "log10_pval", "log10_qval", "summit_pos_from_start")) %>% 
+  unite(id, c("chr", "start", "end"), remove = F) %>%
+  select(-contains("X")) %>% 
+  left_join(mq0.01_peaks_rep2_cov, by = "id") %>% 
+  anno_peaks()
+
+mq0.01_rep2_i_G144 <- fread("/projects/marralab_cic_prj/tf_first_analysis/rep2_i_G144/intersect_peaks.bed",
+                            col.names = c("chr", "start", "end", "X1", "X2", "X3", "overlap")) %>% 
+  select(-contains("X")) %>% 
+  unite(id, c("chr", "start", "end"))
+
+mq0.01_peaks_rep2_i_G144 <- mq0.01_peaks_rep2 %>% 
+  filter(id %in% mq0.01_rep2_i_G144$id)
+
+FC_thresh <- min(mq0.01_peaks_rep2_i_G144$fold_change)
+Q_thresh <- min(mq0.01_peaks_rep2_i_G144$log10_qval)
+
+mq0.01_peaks_rep2 <- mq0.01_peaks_rep2 %>% 
+  mutate(tier = if_else(id %in% mq0.01_peaks_rep2_i_G144$id, 1, 3),
+         tier = if_else(tier != 1 & log10_qval >= Q_thresh & fold_change >= FC_thresh, 2, tier))
+
+```
+
+# manually plot peak heatmap using deeptools/computeMatrix output
+```{r}
+mq0.01_peak_mapper <- mq0.01_peaks_rep2 %>%
+  select(chr, start, end, log10_qval, distanceToTSS, tier) %>% 
+  mutate(chr = str_replace(chr, "chr", ""),
+         center = as.integer((start + end) / 2),
+         class = if_else(abs(distanceToTSS) <= 2000, "proximal", "distal")) %>%
+  unite(mapper, c("chr", "center"), sep = "_") %>% 
+  select(-c(start, end, distanceToTSS))
+
+rpkm_df <- function(x) {
+  # order of histone mod samples according to deeptools/multiBigwigSummary output
+  samples <- c("F8A2", "F8E10", "F8", "NHAA2", "NHA", "NHAH9")
+  
+  n_bins = 100
+  
+  df <- fread(x, skip = 1, col.names = c("chr", "start", "end", "CIC", samples)) %>% 
+    mutate(id = rep(seq(1:(nrow(.)/n_bins)), each = 100),
+           pos = rep(seq(1:n_bins), (nrow(.)/n_bins)),
+           dist = (-50 - (100 * ((n_bins / 2) - pos))) / 1000) %>%
+    gather(sample, rpkm, samples) %>% 
+    group_by(id, sample) %>%
+    mutate(sum = sum(rpkm),
+           rpkm = rpkm / sum,
+           mapper = str_c(as.character(chr), "_", as.character(first(start) + 5000))) %>% 
+    ungroup() %>% 
+    left_join(mq0.01_peak_mapper) %>% 
+    arrange(-log10_qval)
+  
+  return(df)
+}
+
+mq0.01_h3k4me1_rpkm <- rpkm_df("/projects/marralab_cic_prj/tf_first_analysis/A77581/peaks/mq0.01_5kb_h3k4me1_rpkm.tab")
+
+ggplot(head(mq0.01_h3k4me1_rpkm, 500000), aes(dist, mapper, fill = rpkm)) +
+  geom_tile() +
+  scale_fill_gradient(low = "white", high = "gray10") +
+  facet_wrap(~sample) +
+  theme(axis.text.y = element_blank(),
+        axis.ticks.y = element_blank())
+
+mq0.01_h3k27me3_rpkm <- rpkm_df("/projects/marralab_cic_prj/tf_first_analysis/A77581/peaks/mq0.01_5kb_h3k27me3_rpkm.tab")
+
+mq0.01_h3k27me3_rpkm <- mq0.01_h3k27me3_rpkm %>% select(-class) %>% left_join(mq0.01_peak_mapper %>% select(mapper, class))
+
+ggplot(head(mq0.01_h3k27me3_rpkm, 500000), aes(dist, mapper, fill = rpkm)) +
+  geom_tile() +
+  scale_fill_gradient(low = "white", high = "gray10") +
+  facet_wrap(~sample) +
+  theme(axis.text.y = element_blank(),
+        axis.ticks.y = element_blank())
+
+smooth_padbin_rpkm <- function(x) {
+  df <- x %>% 
+    na.omit() %>%
+    group_by(sample, dist) %>% 
+    summarize(mean_rpkm = mean(rpkm)) %>%
+    ungroup()
+  
+  return(df)
+}
+
+mq0.01_h3k27me3_rpkm_smooth <- smooth_padbin_rpkm(mq0.01_h3k27me3_rpkm, filt = "proximal")
+
+ggplot(mq0.01_h3k27me3_rpkm_smooth, aes(dist, mean_rpkm, col = sample)) +
+  geom_path(size = 1)
+
+mq0.01_h3k27me3_rpkm_smooth <- smooth_padbin_rpkm(mq0.01_h3k27me3_rpkm, filt = "distal")
+
+ggplot(mq0.01_h3k27me3_rpkm_smooth, aes(dist, mean_rpkm, col = sample)) +
+  geom_path(size = 1)
+
+mq0.01_h3k27me3_rpkm_smooth <- smooth_padbin_rpkm(mq0.01_h3k27me3_rpkm %>% filter(tier == 1, class == "proximal"))
+
+ggplot(mq0.01_h3k27me3_rpkm_smooth, aes(dist, mean_rpkm, col = sample)) +
+  geom_path(size = 1)
+
+ggplot(mq0.01_h3k27me3_rpkm_smooth, aes(dist, mean_rpkm, col = sample)) +
+  geom_path(size = 1)
+
+ggplot(cons_peaks_padbin_2kb_smooth %>% filter(mark != "input"), aes(dist, mean_spkm, col = cell_line)) +
+  geom_path(size = 1) +
+  facet_wrap(fct_rev(as.factor(IDH1)) ~ mark, nrow = 2, ncol = 6, scales = "free") +
+  scale_colour_manual(values = c("mediumblue", "firebrick1", "firebrick3", "cornflowerblue", "tomato", "tomato3")) +
+  labs(x = "Distance to Peak Center (Kb)", y = "Mean SPKM", col = NULL) + 
+  guides(colour = guide_legend(nrow = 1)) + 
+  theme(axis.title = element_text(size = 18),
+        legend.text = element_text(size = 16),
+        legend.position = "bottom")
+
+# Coverage across FindER peaks
+smooth_padbin_rpkm <- function(x, caller = "FindER") {
+  pad <- str_c(str_replace(x, "kb", ""), "000") %>% as.numeric()
+  n_bins <- ifelse(pad == 2000, 40, ifelse(pad == 5000, 100, 200))
+  
+  prefix <- ifelse(caller == "FindER", "f_i_G144_", "mq0.01_i_G144_")
+  
+  df <- fread(str_c("/projects/marralab_cic_prj/tf_first_analysis/A77581/peaks/", prefix, x, "_rpkm.tab"),
+              col.names = c("chr", "start", "end", "NHA_rep1_chip", "NHA_rep1_input", "NHA_rep2_chip", "NHA_rep2_input"))
+  
+  n_peaks = nrow(df) / n_bins
+  
+  df <- df %>% 
+    mutate(pos = rep(seq(1:n_bins), n_peaks),
+           dist = (-50 - (100 * ((n_bins / 2) - pos))) / 1000) %>%
+    gather(sample, rpkm, contains("NHA")) %>%
+    group_by(sample, dist) %>% 
+    summarize(mean_rpkm = mean(rpkm)) %>%
+    ungroup() %>% 
+    mutate(type = if_else(sample %like% "chip", "ChIP", "Input"),
+           sample = str_replace(sample, "(NHA_rep.)_.*", "\\1"),
+           tool = caller)
+  
+  return(df)
+}
+  
+  sample_n(mq0.01_peak_mat, 10000)
+
+padbin_mapper <- cons_peaks_both_reps %>%
+  mutate(summit_pos_2kb = start + rel_summit_pos - 2000) %>% 
+  select(chr, summit_pos_2kb)
+
+padbin_mapper_full <- data.frame()
+for(i in 1:nrow(padbin_mapper)) {
+  start <- padbin_mapper$summit_pos_2kb[i]
+  add <- data.frame(chr = rep(padbin_mapper$chr[i], length(start)), bin_start =  seq(start, start + 3900, 100))
+  padbin_mapper_full <- rbind(padbin_mapper_full, add)
+}
+  
+df <- fread(x, col.names = c("chr", "start", "end", "id", "cov")) %>% 
+    mutate(# position is the bin number
+           pos = as.numeric(str_replace(id, "_", "")),
+           # our peaks are padded into 100 bins of 100bp, the following = the distance of bin center to peak center in kb
+           dist = (-50 - (100 * (20 - pos))) / 1000,
+           spkm = (cov * 1e9) / (mapped * 100))
+
+ggplot()
+```
+
+
+```
+mq0.01_peaks_rep2 <- readRDS("/projects/marralab_cic_prj/tf_first_analysis/R_objects/mq0.01_peaks_tss_1.rds") %>% 
+  (sample == "NHA_rep2")
+
+rep2_peaks <- fread(str_c(wd, "A77581/peaks/cons_peaks.bed"), col.names = c("chr", "start", "end", "peak_id", "X2", "strand", "fold_change", "log10_pval", "log10_qval", 
+                                                                            "rel_summit_pos", "f_chr", "f_start", "f_end", "f_log10_pval", "overlap")) %>% 
+  select(-contains("X"))
+n_rep2_peaks <- nrow(rep2_peaks_ids)
+
+G144_peaks <- fread(str_c(wd, "../Weissman_et_al/paper_peaks/G144_24h_MEKi.hg19.sorted.bed"),
+                    col.names = c("chr", "start", "end")) %>% 
+  unite(id, c("chr", "start", "end"), sep = "_") %>% unique()
+```
+
+Objective: obtain a consensus set of high confidence CIC peaks
+Since FindER and MACS2 resulted in highly discordant number of peaks between replicates, we can take commonly identified peaks to increase the likelihood of obtaining true binding events and eliminating false positives. To do this, Bedtools intersect was used to return peaks that overlapped between MACS2 and FindER:
+
+```
+intersect_peakcaller_loop = $(foreach lib, ${libs_no_input}, $(lib)/peaks/cons_peaks.bed)
+intersect_peakcaller : ${intersect_peakcaller_loop}
+
+%/peaks/cons_peaks.bed :
+        ${bedtools}/intersectBed -wo -a $*/peaks/macs2_q0.01_peaks.narrowPeak \
+        -b $*/peaks/peaks.sorted.bed > $@
+```
+
+```{r}
+rep1_peaks <- fread(str_c(wd, "A77579/peaks/cons_peaks.bed"), col.names = c("chr", "start", "end", "peak_id", "X2", "strand", "fold_change", "log10_pval", "log10_qval", 
+                                                                            "rel_summit_pos", "f_chr", "f_start", "f_end", "f_log10_pval", "overlap")) %>% 
+  select(-contains("X"))
+
+rep1_peaks_ids <- rep1_peaks %>%
+  unite(id, c("chr", "start", "end"), sep = "_") %>% 
+  select(id) %>% unique()
+n_rep1_peaks <- nrow(rep1_peaks_ids)
+write_tsv(rep1_peaks_ids, str_c(wd, "A77579/peaks/rep1_peaks_ids.txt"), col_names = F)
+
+rep2_peaks <- fread(str_c(wd, "A77581/peaks/cons_peaks.bed"), col.names = c("chr", "start", "end", "peak_id", "X2", "strand", "fold_change", "log10_pval", "log10_qval", 
+                                                                            "rel_summit_pos", "f_chr", "f_start", "f_end", "f_log10_pval", "overlap")) %>% 
+  select(-contains("X"))
+n_rep2_peaks <- nrow(rep2_peaks_ids)
+
+G144_peaks <- fread(str_c(wd, "../Weissman_et_al/paper_peaks/G144_24h_MEKi.hg19.sorted.bed"),
+                    col.names = c("chr", "start", "end")) %>% 
+  unite(id, c("chr", "start", "end"), sep = "_") %>% unique()
+n_G144_peaks <- nrow(G144_peaks)
+
+cic_pos_genes <- c("ETV4", "ETV5", "DUSP4", "GPR3", "SPRY4")
+
+rep2_peaks_ids <- rep2_peaks %>%
+  unite(id, c("chr", "start", "end"), sep = "_") %>% 
+  select(id) %>% unique()
+write_tsv(rep2_peaks_ids, str_c(wd, "A77579/peaks/rep2_peaks_ids.txt"), col_names = F)
+
+anno_peaks <- function(x) {
+  require(ChIPseeker)
+  require(TxDb.Hsapiens.UCSC.hg19.knownGene)
+  txdb <- TxDb.Hsapiens.UCSC.hg19.knownGene
+  
+  if(str_detect(x$chr, "chr") == F) {
+    x <- x %>% mutate(chr = str_c("chr", chr))
+  }
+  
+  df <- x %>%
+    makeGRangesFromDataFrame(keep.extra.columns = T) %>%
+    annotatePeak(tssRegion = c(-1500, 500), TxDb = txdb, annoDb = "org.Hs.eg.db") %>% 
+    as.data.frame() %>% 
+    mutate(annotation = str_replace(annotation, " \\(.*\\)", ""),
+           annotation = if_else(annotation == "Downstream", "Distal Intergenic", annotation),
+           annotation = as.factor(annotation),
+           geneStrand = if_else(geneStrand == 1, "+", "-"))
+  
+  return(df)
+}
+
+rep1_peaks_anno <- rep1_peaks %>% anno_peaks()
+rep2_peaks_anno <- rep2_peaks %>% anno_peaks()
+
+ggplot(rep1_peaks_anno, aes(fct_infreq(annotation))) +
+  geom_bar()
+
+ggplot(rep2_peaks_anno, aes(fct_infreq(annotation))) +
+  geom_bar()
+
+# peaks overlapping in both replicates
+both_reps_peaks <- fread(str_c(wd, "merged_peaks/cons_peaks_both.bed"), 
+                         col.names = c("chr", "start_1", "end_1", "X1", "X2", "X3", "fold_change_1", "log10_pval_1", "log10_qval_1", 
+                                       "rel_summit_pos_1", "X4", "f_start_1", "f_end_1", "f_log10_pval_1", "X5",
+                                       "X6", "start_2", "end_2", "X7", "X8", "X9", "fold_change_2", "log10_pval_2", "log10_qval_2", 
+                                       "rel_summit_pos_2", "X10", "f_start_2", "f_end_2", "f_log10_pval_2", "X11", "overlap")) %>% 
+  select(-contains("X")) %>% 
+  mutate(id_1 = str_c(chr, "_", start_1, "_", end_1),
+         id_2 = str_c(chr, "_", start_2, "_", end_2),
+         length_1 = end_1 - start_1,
+         f_length_1 = f_end_1 - f_start_1,
+         length_2 = end_2 - start_2,
+         f_length_2 = f_end_2 - f_start_2,
+         summit_1 = start_1 + rel_summit_pos_1,
+         summit_2 = start_2 + rel_summit_pos_2,
+         summit_dist = abs(summit_1 - summit_2))
+
+# since peaks have different start and end coordinates between replicates, perform downstream analyses (ie motif enrichment) for each rep separately 
+
+#filter peaks in each replicate to keep those that overlap between the two
+rep1_peaks_both <- rep1_peaks %>%
+  unite(id, c("chr", "start", "end"), sep = "_", remove = F) %>% 
+  filter(id %in% both_reps_peaks$id_1) %>% 
+  select(chr, start, end, peak_id, rel_summit_pos, strand) %>% 
+  unique()
+write_tsv(rep1_peaks_both, str_c(wd, "A77579/peaks/cons_peaks_both.bed"), col_names = F)
+
+rep2_peaks_both <- rep2_peaks %>%
+  unite(id, c("chr", "start", "end"), sep = "_", remove = F) %>% 
+  filter(id %in% both_reps_peaks$id_2) %>% 
+  select(chr, start, end, peak_id, rel_summit_pos, strand) %>% 
+  unique()
+write_tsv(rep2_peaks_both, str_c(wd, "A77581/peaks/cons_peaks_both.bed"), col_names = F)
+
+
+min_fc <- min(c(both_reps_peaks$fold_change_1, both_reps_peaks$fold_change_2))
+min_log10qval <- min(c(both_reps_peaks$log10_qval_1, both_reps_peaks$log10_qval_2))
+
+rep1_peaks_filt <- rep1_peaks %>%
+  filter(fold_change >= min_fc, log10_qval >= min_log10qval)
+
+rep2_peaks_filt <- rep2_peaks %>% 
+  filter(fold_change >= min_fc, log10_qval >= min_log10qval)
+
+```
+
+```
+#intersect consensus peaks with peaks identified in G144 (Weissmann et al)
+cons_i_Weissman_loop = $(foreach lib, ${libs_no_input}, $(lib)/peaks/cons_i_G144.bed)
+cons_i_Weissman : ${cons_i_Weissman_loop}
+
+%/peaks/cons_i_G144.bed :
+        ${bedtools}/intersectBed -wo -a $*/peaks/cons_peaks.bed \
+        -b ../Weissman_et_al/paper_peaks/G144_24h_MEKi.hg19.sorted.bed | \
+        cut -f 1-6 | sort -u > $@; \
+        ${bedtools}/intersectBed -wo -a $*/peaks/cons_peaks_both.bed \
+        -b ../Weissman_et_al/paper_peaks/G144_24h_MEKi.hg19.sorted.bed | \
+        cut -f 1-6 | sort -u > $*/peaks/cons_both_i_G144.bed
+```
+
+```{r}
+rep1_cons_i_G144 <- fread(str_c(wd, "A77579/peaks/cons_i_G144.bed"),
+                          col.names = c("chr", "start", "end", "peak_id", "rel_summit_pos", "strand")) %>% 
+  mutate(rep = "rep1") %>% 
+  unite(coord, c("chr", "start", "end"), sep = "_", remove = F)
+
+rep2_cons_i_G144 <- fread(str_c(wd, "A77581/peaks/cons_i_G144.bed"),
+                          col.names = c("chr", "start", "end", "peak_id", "rel_summit_pos", "strand")) %>% 
+  mutate(rep = "rep2") %>% 
+  unite(coord, c("chr", "start", "end"), sep = "_", remove = F)
+
+cons_i_G144 <- rbind(rep1_cons_i_G144, rep2_cons_i_G144) %>% 
+  mutate(overlap = "G144") %>% 
+  unite(coord, c("chr", "start", "end"), sep = "_", remove = F)
+
+cons_peaks_both_reps <- rbind(rep1_peaks_both %>% mutate(rep = "rep1"), rep2_peaks_both %>% mutate(rep = "rep2")) %>% 
+  mutate(overlap = "reps") %>% 
+  unite(coord, c("chr", "start", "end"), sep = "_", remove = F)
+write_tsv(cons_peaks_both_reps %>% 
+            select(chr, start, end, coord, rel_summit_pos, strand, rep) %>% 
+            mutate(chr = str_c("chr", chr)),
+          str_c(wd, "merged_peaks/cons_peaks_both_reps.bed"), col_names = F)
+cons_peaks_both_reps_i_G144.bed <- fread(str_c(wd, "merged_peaks/cons_peaks_both_reps_i_G144.bed"))
+
+
+final_peaks <- rbind(cons_i_G144, cons_peaks_both_reps) %>% 
+  anno_peaks()
+
+n_rep1_i_G144 <- nrow(cons_i_G144 %>% filter(rep == "rep1"))
+n_rep2_i_G144 <- nrow(cons_i_G144 %>% filter(rep == "rep2"))
+n_rep1_i_rep2 <- nrow(cons_peaks_both_reps %>% filter(rep == "rep1"))
+final_peaks_intersect_all <- final_peaks %>%
+  unite(id, c("seqnames", "start", "end"), sep = "_", remove = F) %>% 
+  group_by(id) %>% 
+  filter(n() > 1)
+
+n_intersect_all <- nrow(final_peaks_intersect_all) / 4
+
+final_peaks_collapse <- final_peaks %>% 
+  select(chr = seqnames, start, end, coord, rel_summit_pos, strand, rep) %>% 
+  mutate(strand = ".") %>% 
+  unique() %>% 
+  anno_peaks()
+saveRDS(final_peaks_collapse, str_c(wd, "R_objects/final_peaks_collapse.rds"))
+write_tsv(final_peaks_collapse, str_c(wd, "merged_peaks/final_peaks.bed"), col_names = F)
+
+ggplot(final_peaks_collapse, aes(log(abs(distanceToTSS) + 1))) +
+  geom_density()
+
+ggplot(final_peaks_collapse, aes(width)) +
+  geom_density()
+
+ggplot(final_peaks_collapse, aes(fct_infreq(annotation))) +
+  geom_bar()
+
+write_tsv(final_peaks_collapse %>% 
+            filter(rep == "rep1") %>% 
+            mutate(chr = str_replace(chr, "chr", "")), 
+          str_c(wd, "A77579/peaks/final_peaks.bed"), col_names = F)
+
+write_tsv(final_peaks_collapse %>% 
+            filter(rep == "rep2") %>% 
+            mutate(chr = str_replace(chr, "chr", "")), 
+          str_c(wd, "A77581/peaks/final_peaks.bed"), col_names = F)
+
+library(VennDiagram)
+draw.triple.venn(n_rep1_peaks, n_rep2_peaks, n_G144_peaks, 
+                 n12 = n_rep1_i_rep2, n13 = n_rep1_i_G144, n23 = n_rep2_i_G144,
+                 n_intersect_all , euler.d = T, scale = T)
+```
+
+
+
+
+```{r}
+library(knitr)
+rep1_peaks_anno %>% 
+  filter(SYMBOL %in% cic_pos_genes) %>% 
+  kable()
+
+rep2_peaks_anno %>% 
+  filter(SYMBOL %in% cic_pos_genes) %>% 
+  kable()
+```
+
+```{r}
+mq0.01_peaks <- readRDS(str_c(wd, "R_objects/mq0.01_peaks_tss.rds")) %>% 
+  unite(coord, c("chr", "start", "end"), sep = "_", remove = F)
+
+mq0.01_peaks_summary <- summarize_peaks(mq0.01_peaks, flagstats)
+
+mq0.01_peaks_final <- mq0.01_peaks %>%
+  filter(coord %in% final_peaks$coord)
+saveRDS(mq0.01_peaks_final, str_c(wd, "R_objects/mq0.01_peaks_final.rds"))
+
+write_tsv(mq0.01_peaks_final %>% 
+            mutate(chr = str_c("chr", chr)) %>% 
+            select(chr, start, end, coord, lib), 
+          str_c(wd, "merged_peaks/final_peaks.bed"), col_names = F)
+
+flagstats <- readRDS(str_c(wd, "R_objects/flagstats.rds"))
+summarize_peaks <- function(x, flagstats) {
+  df <- x %>% 
+    group_by(lib) %>% 
+    summarize(n = n(), 
+              mean_log10_qval = mean(log10_qval),
+              mean_peak_size = mean(peak_size), 
+              mean_dist_to_tss = mean(dist_to_tss), 
+              sum_cov = sum(cov_ip)) %>% 
+    # Fraction of reads in peaks (FRIP) -> proportion of mapped reads contributing to peaks (signal to noise ratio)
+    mutate(frip = sum_cov / flagstats$mapped[match(lib, flagstats$lib)] * 100)
+  
+  return(df)
+}
+
+mq0.01_peaks_final_summary <- summarize_peaks(mq0.01_peaks_final, flagstats)
+
+rank(mq0.01_peaks %>% filter(lib == "A77581") %>% select(log10_qval))
+
+mq0.01_peaks_final_promoter_2kb <- mq0.01_peaks_final %>% 
+  filter(abs(dist_to_tss) <= 2000)
+
+```
+
+
+```{r}
+cic_targets <- c("ETV4", "ETV5", "DUSP4", "GPR3", "SPRY4")
+
+theme_1 <- theme(axis.text = element_text(size = 15),
+        axis.title = element_text(size = 18),
+        strip.text = element_text(size = 16),
+        legend.text = element_text(size = 15),
+        panel.grid.major = element_line(linetype = "dotted", colour = "gainsboro"))
+
+plot_cov_in_peaks <- function(x) {
+  require(ggrepel)
+  
+  ggplot(x, aes(log10(norm_input + 1), log10(norm_ip + 1))) +
+    geom_hex(size = 1, col = "grey") +
+    geom_point(data = subset(x, gene_name %in% cic_targets & dist_to_tss < 2000), size = 1.5, col = "coral1") +
+    geom_text_repel(data = subset(x, gene_name %in% cic_targets & dist_to_tss < 2000), aes(label = gene_name), 
+									  size = 4, fontface = "bold", arrow = arrow(length = unit(0.02, "npc"))) +
+	  geom_abline(slope = 1, intercept = 0, col = "black", linetype = "dashed") +
+    facet_wrap(~sample, nrow = 2) +
+    labs(x = "Normalized Coverage in Input (log10)", y = "Normalized Coverage in IP (log10)", fill = "Count") +
+    scale_fill_gradient(low = "seagreen1", high = "seagreen4") +
+    coord_fixed() +
+    theme(legend.position = c(0.9, 0.2)) +
+    theme_1
+}
+
+plot_cov_in_peaks(mq0.01_peaks)
+
+
+```
+
+
+```
+c <- fread(str_c(wd, "merged_peaks/cons_peaks_both.bed")) %>% 
+  select(chr = 1, start_rep1 = 2, end_rep1 = 3, rel_summit_pos_rep1 = 10, f_start_rep1 = 12, f_end_rep1 = 13, 
+         start_rep2 = 17, end_rep2 = 18, rel_summit_pos_rep2 = 25, f_start_rep2 = 27, f_end_rep2 = 28) %>% 
+  mutate(summit_rep1 = start_rep1 + rel_summit_pos_rep1, center_rep1 = (f_end_rep1 + f_start_rep1) / 2,
+         summit_rep2 = start_rep2 + rel_summit_pos_rep2, center_rep2 = (f_end_rep2 + f_start_rep2) / 2,
+         summit_dist = abs(summit_rep1 - summit_rep2), center_dist = abs(center_rep1 - center_rep2))
+
+summary(c$summit_dist)
+summary(c$center_dist)
+
+sum(a2$SYMBOL %in% b2$SYMBOL)
+
+cic_pos_genes %in% c$SYMBOL
+write_csv(c %>% select(SYMBOL), str_c(wd, "merged_peaks/cons_peaks_both_genes.csv"))
+
+```
+
+# How many peaks are associated with DE genes?
+```{r}
+NHA_DE_genes_q0.01 <- readRDS("/projects/marralab_cic_prj/rna_seq/R_objects/NHA_CIC_DE_common_res_q0.01.rds")
+F8_DE_genes_q0.01 <- readRDS("/projects/marralab_cic_prj/rna_seq/R_objects/F8_CIC_DE_common_res_q0.01.rds")
+
+rep1_peaks_DE <- mq0.01_peaks_final %>% 
+  filter(sample == "NHA_rep1", gene_name %in% NHA_DE_genes_q0.01$gene_ID)
+rep1_peaks_DE_F8 <- mq0.01_peaks_final %>% 
+  filter(sample == "NHA_rep1", gene_name %in% F8_DE_genes_q0.01$gene_ID)
+
+
+rep2_peaks_DE_NHA <- mq0.01_peaks_final %>% 
+  filter(sample == "NHA_rep2", gene_name %in% NHA_DE_genes_q0.01$gene_ID)
+rep2_peaks_DE_F8 <- mq0.01_peaks_final %>% 
+  filter(sample == "NHA_rep2", gene_name %in% F8_DE_genes_q0.01$gene_ID)
+
+CIC_direct_targets <- rbind(rep1_peaks_DE, rep1_peaks_DE_F8, rep2_peaks_DE_NHA, rep2_peaks_DE_NHA) %>% 
+  select(gene_name) %>% unique() %>% unlist()
+
+NHA_A2_res_full <- readRDS("/projects/marralab_cic_prj/rna_seq/R_objects/NHA_A2_res_full.rds")
+NHA_H9_res_full <- readRDS("/projects/marralab_cic_prj/rna_seq/R_objects/NHA_H9_res_full.rds")
+
+NHA_CIC_DE_common_res <- get_common_DE_genes(NHA_A2_res_full, NHA_H9_res_full)
+NHA_CIC_DE_common_res_combined <- combine_DE_genes(NHA_CIC_DE_common_res, threshold = 1)
+
+F8_A2_res_full <- readRDS("/projects/marralab_cic_prj/rna_seq/R_objects/F8_A2_res_full.rds")
+F8_E10_res_full <- readRDS("/projects/marralab_cic_prj/rna_seq/R_objects/F8_E10_res_full.rds")
+
+F8_CIC_DE_common_res <- get_common_DE_genes(F8_A2_res_full, F8_E10_res_full)
+F8_CIC_DE_common_res_combined <- combine_DE_genes(F8_CIC_DE_common_res, threshold = 1)
+
+bedt_DB_h3k27me3_results_promoter <- readRDS("/projects/marralab_cic_prj/histone_mod_chip/R_objects/bedt_DB_h3k27me3_results_promoter.rds")
+bedt_DB_h3k27me3_results_promoter_NHA <- bedt_DB_h3k27me3_results_promoter %>% filter(IDH1 == "IDH1_WT")
+bedt_DB_h3k27me3_results_promoter_F8 <- bedt_DB_h3k27me3_results_promoter %>% filter(IDH1 == "IDH1_R132H")
+
+b <- NHA_DE_genes_q0.01 %>% 
+  filter(gene_ID %in% bedt_DB_h3k27me3_results_promoter_NHA$SYMBOL)
+
+a <- F8_DE_genes_q0.01 %>% 
+  filter(gene_ID %in% bedt_DB_h3k27me3_results_promoter_F8$SYMBOL)
+
+
+```
+
+# Correlate CIC peaks with RNA-seq
+```{r}
+mq0.01_peaks_final_norm <- mq0.01_peaks_final %>%
+  mutate(norm = norm_ip / norm_input)
+
+#import files to map gene names to ensembl ID and annotate gene info
+pd <- "/projects/marralab_cic_prj/"
+ensembl_mapper <- read.delim(str_c(pd,"shared_objects/ensembl_mapper.tsv"), sep = '\t', header = T, stringsAsFactors = F)
+
+gene_anno <- read.delim(str_c(pd,"shared_objects/gene_annotations.tsv"), sep = '\t', header = F, 
+												col.names = c("chromosome","ensembl_ID","biotype"), stringsAsFactors = F) %>% 
+	unique()
+
+#obtain gene lengths
+library(GenomicFeatures)
+hg19.ens <- makeTxDbFromUCSC(genome="hg19", tablename="ensGene")
+exonic <- exonsBy(hg19.ens, by="gene")
+red.exonic <- reduce(exonic)
+exon.lengths <- sum(width(red.exonic))
+exon_len_df <- data.frame(ensembl_id = names(exon.lengths),
+                          length = exon.lengths)
+
+# remove L54 data
+all_counts <- readRDS("/projects/marralab_cic_prj/rna_seq/R_objects/all_counts.rds") %>% 
+  select(-contains("L54"))
+all_counts_keep <- all_counts[rowSums(all_counts) > 0, ]
+
+all_counts_keep_gene_len <- all_counts_keep %>%
+  rownames_to_column("ensembl_id") %>% 
+  left_join(exon_len_df) %>% 
+  column_to_rownames("ensembl_id") %>% 
+  select(length) %>% unlist()
+
+library(edgeR)
+all_counts_keep_rpkm <- all_counts_keep %>% 
+  apply(2, as.numeric) %>%
+  as.data.frame() %>% 
+  mutate(ensembl_id = rownames(all_counts_keep)) %>% 
+  column_to_rownames("ensembl_id") %>% 
+  as.matrix() %>% 
+  rpkm(gene.length = all_counts_keep_gene_len) %>%
+  as.data.frame() %>% 
+  rownames_to_column("ensembl_ID") %>% 
+  gather(sample, rpkm, -one_of("ensembl_ID")) %>% 
+  filter(!(sample %like% "L54")) %>% 
+  merge(ensembl_mapper, by = "ensembl_ID", all = T) %>%
+	merge(gene_anno, by = "ensembl_ID", all = T) %>% 
+  na.omit() %>%
+  separate(sample, c("cell_line", "rep"), sep = "_")
+
+saveRDS(all_counts_keep_rpkm, "/projects/marralab_cic_prj/rna_seq/R_objects/all_counts_keep_rpkm.rds")
+
+all_counts_keep_cic_targets <- all_counts_keep_rpkm %>% 
+  filter(gene_ID %in% mq0.01_peaks_final$gene_name) %>% 
+  left_join(mq0.01_peaks_final_norm %>% select(gene_ID = gene_name, norm)) %>% 
+  group_by(gene_ID, cell_line) %>% 
+  summarize(mean_norm = mean(norm), mean_rpkm = mean(rpkm))
+
+all_counts_keep_cic_targets_DE <- all_counts_keep_cic_targets %>% 
+  left_join(NHA_CIC_DE_common_res_combined %>% select(gene_ID, log2FoldChange))
+
+cor(all_counts_keep_cic_targets$mean_rpkm, all_counts_keep_cic_targets$mean_norm, method = "pearson")
+
+ggplot(all_counts_keep_cic_targets, aes(log2(mean_norm), log2(mean_rpkm))) +
+  geom_point() +
+  facet_wrap(~cell_line)
+
+all_logcounts_keep <- log2(all_counts_keep + 1)
+cic_target_logcounts <- all_logcounts_keep[rownames(all_logcounts_keep) %in% mq0.01_peaks_final$ensg_ID, ]
+cic_target_promoter_2kb_logcounts <- all_logcounts_keep[rownames(all_logcounts_keep) %in% subset(mq0.01_peaks_final, abs(dist_to_tss) <= 2000)$ensg_ID, ]
+
+anno_df <- data.frame(CIC = rep(c(rep("WT", 3), rep("KO", 6)), 2), 
+                      IDH1 = c(rep("R132H", 9), rep("WT", 9)), 
+                      row.names = colnames(all_logcounts_keep))
+
+anno_colors = list(CIC = c("#14AA7B", "#85BFAD"), IDH1 = c("#ED6904", "#FFC69E"))
+names(anno_colors$CIC) <- unique(anno_df$CIC)
+names(anno_colors$IDH1) <- unique(anno_df$IDH1)
+
+library(pheatmap)
+pheatmap(cic_target_logcounts, 
+         col = colorRampPalette(c("seagreen3", "white", "tomato"))(100), 
+         scale = "row",
+         cluster_rows = T, 
+         cluster_cols = T, 
+         show_rownames = F, 
+         annotation_col = anno_df, 
+         annotation_colors = anno_colors)
+
+pheatmap(cic_target_promoter_2kb_logcounts, 
+         col = colorRampPalette(c("seagreen3", "white", "tomato"))(100), 
+         scale = "row",
+         cluster_rows = T, 
+         cluster_cols = T, 
+         show_rownames = F, 
+         annotation_col = anno_df, 
+         annotation_colors = anno_colors)
+
+```
+
+
+
+
+# Correlate Final CIC Peaks with Histone Mark Peaks and Chromatin States
+```
+hmod_final_peak_jac_loop = $(foreach lib, ${hmod_libs}, ./jacs/$(lib)_final_peak_jac.bed)
+hmod_final_peak_jac : ${hmod_final_peak_jac_loop}
+
+./jacs/%_final_peak_jac.bed :
+        ${bedtools}/bedtools jaccard -a ./merged_peaks/final_peaks_merged.bed \
+        -b ${h_chip}/$*/peaks/peaks.sorted.bed | tail -1 > $@
+
+chmm_18_final_peak_jac_loop = $(foreach state, ${chromhmm_18_states}, ./jacs/$(state)/jacs.tsv)
+chmm_18_final_peak_jac : ${chmm_18_final_peak_jac_loop}
+
+./jacs/%/jacs.tsv :
+        mkdir ./jacs/$*; \
+        for i in ${h_chip}/ChromHMM_hg19_18states_output/$*/*; do \
+                ${bedtools}/bedtools jaccard -a ./merged_peaks/final_peaks_merged.bed \
+                -b $$i | tail -1 > ./jacs/$*/$$i_final_peack_jac.bed; \
+        done
+```
+```{r}
+read_hmod_jacs <- function(x) {
+    df <- fread(x) %>% 
+      select(jac = 3) %>% 
+      mutate(sample = str_replace(str_split(x, simplify = T, pattern = "/")[6], "_final_peak_jac.bed", "")) %>% 
+      separate(sample, c("cell_line", "rep", "mark"), sep = "_") %>% 
+      mutate(CIC = if_else(cell_line %in% c("NHA", "F8"), "CIC_WT", "CIC_KO"),
+             IDH1 = if_else(cell_line %like% "NHA", "IDH1_WT", "IDH1_R132H"))
+    
+    return(df)
+}
+
+final_peaks_hmod_jacs <- str_c(wd, "jacs/", str_subset(dir(str_c(wd, "jacs/")), "h3")) %>% 
+  map(read_hmod_jacs) %>% 
+  bind_rows()
+
+final_peaks_hmod_jacs_summary <- final_peaks_hmod_jacs %>% 
+  group_by(mark, IDH1, CIC) %>% 
+  summarize(mean_jac = mean(jac))
+
+read_chmm_jacs <- function(x) {
+    df <- fread(x) %>% 
+      select(sample = 1, jac = 4) %>% 
+      mutate(state = str_split(x, simplify = T, pattern = "/")[6]) %>% 
+      separate(sample, c("cell_line", "rep"), sep = "_") %>% 
+      mutate(CIC = if_else(cell_line %in% c("NHA", "F8"), "CIC_WT", "CIC_KO"),
+             IDH1 = if_else(cell_line %like% "NHA", "IDH1_WT", "IDH1_R132H"))
+    
+    return(df)
+}
+
+chromhmm_18_mapper <- readRDS("/projects/marralab_cic_prj/histone_mod_chip/R_objects/chromhmm_18_mapper.rds")
+
+final_peaks_chmm_jacs <- str_c(str_subset(list.dirs(str_c(wd, "jacs")), "E"), "/", dir(str_subset(list.dirs(str_c(wd, "jacs")), "E"))) %>% 
+  map(read_chmm_jacs) %>% 
+  bind_rows() %>% 
+  mutate(state = str_replace(state, "E", "") %>% as.integer()) %>% 
+  left_join(chromhmm_18_mapper)
+
+ggplot(final_peaks_chmm_jacs, aes(anno, jac, fill = IDH1)) +
+  geom_boxplot() +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))
+
+ggplot(final_peaks_chmm_jacs, aes(anno, jac, fill = CIC)) +
+  geom_boxplot() +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))
+
+final_peaks_chmm_jacs_summary <- final_peaks_chmm_jacs %>% 
+  group_by(state, IDH1, CIC) %>% 
+  summarize(mean_jac = mean(jac))
+
+```
+
+# Visualize histone mark coverage across CIC peaks
+```{r}
+#import cic peaks overlapping b/w MACS2 and FindER for each replicate
+cons_peaks_rep1 <- fread(str_c(wd, "A77579/peaks/cons_peaks.bed")) %>% 
+  select(chr = 1, start = 2, end = 3, fold_change = 7, log10_qval = 9, rel_summit_pos = 10)
+
+cons_peaks_rep2 <- fread(str_c(wd, "A77581/peaks/cons_peaks.bed")) %>% 
+  select(chr = 1, start = 2, end = 3, fold_change = 7, log10_qval = 9, rel_summit_pos = 10)
+
+cons_peaks_rep1_in_final <- cons_peaks_rep1 %>% 
+  unite(coord, c("chr", "start", "end"), remove = F) %>% 
+  filter(coord %in% final_peaks$coord) %>% 
+  mutate(rep = "rep1")
+
+cons_peaks_rep2_in_final <- cons_peaks_rep2 %>% 
+  unite(coord, c("chr", "start", "end"), remove = F) %>% 
+  filter(coord %in% final_peaks$coord) %>% 
+  mutate(rep = "rep2")
+
+padbin_mapper <- cons_peaks_both_reps %>%
+  mutate(summit_pos_2kb = start + rel_summit_pos - 2000) %>% 
+  select(chr, summit_pos_2kb)
+
+padbin_mapper_full <- data.frame()
+for(i in 1:nrow(padbin_mapper)) {
+  start <- padbin_mapper$summit_pos_2kb[i]
+  add <- data.frame(chr = rep(padbin_mapper$chr[i], length(start)), bin_start =  seq(start, start + 3900, 100))
+  padbin_mapper_full <- rbind(padbin_mapper_full, add)
+}
+
+padbin_mapper_promoter_2kb <- mq0.01_peaks_final_promoter_2kb %>%
+  mutate(summit_pos_2kb = start + summit_pos_from_start - 2000) %>% 
+  select(chr, summit_pos_2kb)
+
+padbin_mapper_promoter_2kb_full <- data.frame()
+for(i in 1:nrow(padbin_mapper_promoter_2kb)) {
+  start <- padbin_mapper_promoter_2kb$summit_pos_2kb[i]
+  add <- data.frame(chr = rep(padbin_mapper_promoter_2kb$chr[i], length(start)), bin_start =  seq(start, start + 3900, 100))
+  padbin_mapper_promoter_2kb_full <- rbind(padbin_mapper_promoter_2kb_full, add)
+}
+
+hmod_flagstats <- readRDS("/projects/marralab_cic_prj/histone_mod_chip/R_objects/histone_mod_chip_flagstats.rds") %>% 
+  unite(sample, c("cell_line", "rep", "mark"), sep = "_")
+
+# read in bed files containing coverage in padbin consensus peaks and filter for those in final CIC peaks
+read_cons_peaks_padbin_cov <- function(x, flagstats, mapper) {
+  cell_line <- str_replace(str_split(x, simplify = T, pattern = "/")[, 6], "^cons_peaks_(.*_rep[1-2])_.*_cov_rep.*$", "\\1")
+  mark <- str_replace(str_split(x, simplify = T, pattern = "/")[, 6], "^cons_peaks_.*_rep[1-2]_(.*)_cov_rep.*$", "\\1")
+  sample <- str_c(cell_line, "_", mark)
+  mapped <- as.numeric(flagstats[flagstats$sample == sample, ]$mapped)
+  rep <- str_replace(str_split(x, simplify = T, pattern = "/")[, 6], "^cons_peaks_.*_cov_(rep[1-2]).bed$", "\\1")
+  
+  df <- fread(x, col.names = c("chr", "start", "end", "id", "cov")) %>% 
+    filter(start %in% mapper$bin_start) %>% 
+    mutate(sample = sample,
+           rep = rep,
+           # position is the bin number
+           pos = as.numeric(str_replace(id, "_", "")),
+           # our peaks are padded into 40 bins of 100bp, the following = the distance of bin center to peak center in kb
+           dist = (-50 - (100 * (20 - pos))) / 1000,
+           spkm = (cov * 1e9) / (mapped * 100))
+  
+  return(df)
+}
+
+cons_peaks_padbin_cov_files <- str_c(wd, "merged_peaks/", str_subset(dir(str_c(wd, "merged_peaks")), "^cons_peaks_.*_cov_rep.*$"))
+cons_peaks_padbin_2kb <- cons_peaks_padbin_cov_files %>% 
+  map(read_cons_peaks_padbin_cov, hmod_flagstats, padbin_mapper_full) %>% 
+  bind_rows() %>% 
+  separate(sample, c("cell_line", "rep", "mark"), sep = "_")
+
+smooth_padbin_peaks <- function(x) {
+  df <- x %>% 
+    group_by(dist, cell_line, mark) %>% 
+    summarize(mean_spkm = mean(spkm)) %>% 
+    mutate(CIC = if_else(cell_line %in% c("NHA", "F8"), "CIC_WT", "CIC_KO"),
+          IDH1 = if_else(cell_line %like% "NHA", "IDH1_WT", "IDH1_R132H"))
+  
+  return(df)
+}
+
+cons_peaks_padbin_2kb_smooth <- smooth_padbin_peaks(cons_peaks_padbin_2kb)
+
+ggplot(cons_peaks_padbin_2kb_smooth %>% filter(mark != "input"), aes(dist, mean_spkm, col = cell_line)) +
+  geom_path(size = 1) +
+  facet_wrap(fct_rev(as.factor(IDH1)) ~ mark, nrow = 2, ncol = 6, scales = "free") +
+  scale_colour_manual(values = c("mediumblue", "firebrick1", "firebrick3", "cornflowerblue", "tomato", "tomato3")) +
+  labs(x = "Distance to Peak Center (Kb)", y = "Mean SPKM", col = NULL) + 
+  guides(colour = guide_legend(nrow = 1)) + 
+  theme(axis.title = element_text(size = 18),
+        legend.text = element_text(size = 16),
+        legend.position = "bottom")
+
+cons_peaks_padbin_2kb_promoter_2kb <- cons_peaks_padbin_cov_files %>% 
+  map(read_cons_peaks_padbin_cov, hmod_flagstats, padbin_mapper_promoter_2kb_full) %>% 
+  bind_rows() %>% 
+  separate(sample, c("cell_line", "rep", "mark"), sep = "_")
+
+cons_peaks_padbin_2kb_promoter_2kb_smooth <- smooth_padbin_peaks(cons_peaks_padbin_2kb_promoter_2kb)
+tss$dist[tss$strand == -1] <- tss$dist[tss$strand == -1] * -1
+
+
+ggplot(cons_peaks_padbin_2kb_promoter_2kb_smooth %>% filter(mark != "input"), aes(dist, mean_spkm, col = cell_line)) +
+  geom_path(size = 1) +
+  facet_wrap(fct_rev(as.factor(IDH1)) ~ mark, nrow = 2, ncol = 6, scales = "free") +
+  scale_colour_manual(values = c("mediumblue", "firebrick1", "firebrick3", "cornflowerblue", "tomato", "tomato3")) +
+  labs(x = "Distance to Peak Center (Kb)", y = "Mean SPKM", col = NULL) + 
+  guides(colour = guide_legend(nrow = 1)) + 
+  theme(axis.title = element_text(size = 18),
+        legend.text = element_text(size = 16),
+        legend.position = "bottom")
+```
+
+
+
+
+```
+mq0.01_peaks_tss_1 <- readRDS(str_c(wd, "R_objects/mq0.01_peaks_tss_1.rds"))
+f_peaks_tss_1 <- readRDS(str_c(wd, "R_objects/f_peaks_tss.rds"))
+
+
+
+mq0.01_peaks_tss_1_pos <- mq0.01_peaks_tss_1 %>% 
+  filter(gene_name %in% cic_pos_genes, sample == "NHA_rep2", dist_to_tss < 2000)
+
+mq0.01_peaks_tss_1_rep2 <- mq0.01_peaks_tss_1 %>% 
+  filter(sample == "NHA_rep2") %>% 
+  mutate(chr = str_c("chr", chr),
+         strand = if_else(strand == "1", "+", "-"))
+
+f_peaks_tss_1_rep2 <- f_peaks_tss_1 %>% 
+  filter(lib == "A77581") %>% 
+  mutate(chr = str_c("chr", chr),
+         strand = if_else(strand == "1", "+", "-"))
+
+mq0.01_peaks_tss_2 <- readRDS(str_c(wd2, "R_objects/mq0.01_peaks_tss.rds"))
+
+NHA_mq0.01_peaks_filt <- fread(str_c(wd2, "merged_peaks/NHA_mq0.01_peaks_filt_tss.bed"), fill = T,
+                               col.names = c("chr", "start", "end", "X1", "X2", "X3", "fold_change", "log10_pval", "log10_qval", 
+                                             "X4", "X5", "X6", "X7", "strand", "ensg_ID", "gene_name", "enst_ID", "X8", "X9", "tss", "X10")) %>%
+  select(-contains("X"))
+                                 
+F8_mq0.01_peaks_filt <- fread(str_c(wd2, "merged_peaks/F8_mq0.01_peaks_filt_tss.bed"), fill = T,
+                               col.names = c("chr", "start", "end", "X1", "X2", "X3", "fold_change", "log10_pval", "log10_qval", 
+                                             "X4", "X5", "X6", "X7", "strand", "ensg_ID", "gene_name", "enst_ID", "X8", "X9", "tss", "X10")) %>%
+  select(-contains("X")) %>% 
+  mutate(peak_center = (end + start) / 2, dist_to_tss = abs(peak_center - tss))
+
+F8_mq0.01_peaks <- fread(str_c(wd2, "merged_peaks/F8_rep1_chip__F8_rep2_chip_mq0.01_peaks_tss.bed"), fill = T,
+                            col.names = c("chr", "start", "end", "X1", "X2", "X3", "fold_change", "log10_pval", "log10_qval", 
+                                          "X4", "X5", "X6", "X7", "strand", "ensg_ID", "gene_name", "enst_ID", "X8", "X9", "tss", "X10")) %>%
+  select(-contains("X"))
+
+F8E10_mq0.01_peaks <- fread(str_c(wd2, "merged_peaks/F8E10_rep1_chip__F8E10_rep2_chip_mq0.01_peaks_tss.bed"), fill = T,
+                            col.names = c("chr", "start", "end", "X1", "X2", "X3", "fold_change", "log10_pval", "log10_qval", 
+                                          "X4", "X5", "X6", "X7", "strand", "ensg_ID", "gene_name", "enst_ID", "X8", "X9", "tss", "X10")) %>%
+  select(-contains("X"))
+
+#lib == "A77579") %>% select(gene_name)) %in% (mq0.01_peaks_tss_1 %>% filter(lib == "A77581") %>% select(gene_name))
+```
+
+
+```
+
+
+mq0.01_peaks_tss_1_rep2_anno <- annotate_peaks(mq0.01_peaks_tss_1_rep2) 
+
+ggplot(mq0.01_peaks_tss_1_rep2_anno, aes(x = log10(abs(distanceToTSS) + 1))) +
+  geom_density(size = 0.8, alpha = 0.4, col = "gray10", fill = "gray10") +
+  labs(x = "Distance to TSS (log10)", y = "Density") +
+  theme(axis.text = element_text(size = 20),
+        axis.title = element_text(size = 24))  
+
+ggplot(mq0.01_peaks_tss_1_rep2_anno, aes(x = fct_infreq(annotation))) +
+  geom_bar(aes(y = ..prop.., group = 1)) +
+  labs(x = NULL, y = "% of Peaks")
+
+f_peaks_tss_1_rep2_anno <- annotate_peaks(f_peaks_tss_1_rep2)
+
+ggplot(f_peaks_tss_1_rep2_anno, aes(x = log10(abs(distanceToTSS) + 1))) +
+  geom_density(size = 0.8, alpha = 0.4, col = "gray10", fill = "gray10") +
+  labs(x = "Distance to TSS (log10)", y = "Density") +
+  theme(axis.text = element_text(size = 20),
+        axis.title = element_text(size = 24))  
+
+ggplot(f_peaks_tss_1_rep2_anno, aes(x = fct_infreq(annotation))) +
+  geom_bar(aes(y = ..prop.., group = 1), width = 0.7, fill = "gray30") +
+  labs(x = NULL, y = "Fraction of Peaks") +
+  theme(axis.text = element_text(size = 20),
+        axis.text.x = element_text(angle = 45, hjust = 1),
+        axis.title = element_text(size = 24))
+```
+
+
+```
+rna_seq_path <- "/projects/marralab_cic_prj/rna_seq/"
+
+NHA_DE_genes <- readRDS(str_c(rna_seq_path, "R_objects/NHA_CIC_DE_common_res_q0.01.rds"))
+F8_DE_genes <- readRDS(str_c(rna_seq_path, "R_objects/F8_CIC_DE_common_res_q0.01.rds"))
+
+f_i_G144_NHA_DE <- NHA_DE_genes %>% filter(gene_ID %in% f_i_G144_tss$gene_name) %>% select(gene_ID, direction) %>% filter(gene_ID != "CIC")
+
+f_i_G144_F8_DE <- F8_DE_genes %>% filter(gene_ID %in% f_i_G144_tss$gene_name) %>% select(gene_ID, direction) %>% filter(gene_ID != "CIC")
+
+c <- a %>% rbind(b) %>% mutate(IDH1 = as.factor(IDH1))
+
+ggplot(c, aes(direction, n, fill = direction)) +
+  geom_col() +
+  facet_wrap(~fct_rev(IDH1)) +
+  scale_fill_manual(values = c("seagreen3", "tomato")) +
+  labs(x = NULL, y = "# of DE Genes (q < 0.01)", fill = NULL) +
+  theme(axis.text = element_text(size = 20),
+        axis.title = element_text(size = 22),
+        strip.text = element_text(size = 20, face = "bold"),
+        legend.position = "none")
+```
+
+```
+read_peaks_promoter <- function(x) {
+  df <- fread(x, col.names = c("chr", "start", "end", "gene_name", "log10_pval", "strand", 
+                               "X1", "X2", "X3", "X4", "X5", "X6", "X7", "X8", "X9", "X10", "X11")) %>% 
+    mutate(lib = str_subset(str_split(x, "/", simplify = T), "A7")) %>% 
+    select(-contains("X"))
+
+  return(df)  
+}
+
+cic_chip_samples_1 <- c("A77579", "A77581")
+cic_chip_peaks_promoter_1 <- str_c(first_sub, cic_chip_samples_1, "/peaks/peaks.sorted.anno.promoter.bed") %>% 
+  map(read_peaks_promoter) %>% 
+  bind_rows() %>% 
+  mutate(p_value = 10 ^ -log10_pval,
+         sample = if_else(lib == "A77579", "NHA_rep1", "NHA_rep2")) %>% 
+  select(-lib) %>% 
+  unique()
+
+NHA_CIC_DE_common_res_q0.01_with_peak <- NHA_CIC_DE_common_res_q0.01 %>% 
+  filter(gene_ID %in% cic_chip_peaks_promoter_1$gene_name)
+
+ggplot(NHA_CIC_DE_common_res_q0.01_with_peak, aes(direction)) +
+  geom_bar()
+```
+
+```
+library(Gviz)
+library(GenomicRanges)
+
+data(cpgIslands)
+gen <- genome(cpgIslands)
+gtrack <- GenomeAxisTrack()
+
+hg19_annot <- read.table()
+hg19_granges <- makeGRangesFromDataFrame(mm9_annot)
+
+data(geneModels)
+grtrack <- GeneRegionTrack(geneModels, genome = gen,
++     chromosome = chr, name = "Gene Model")
+
+samplefile <- system.file("extdata", "hg19_knownGene_sample.sqlite", package = "GenomicFeatures")
+txdb <- loadDb(samplefile)
+txTr <- GeneRegionTrack(txdb, chromosome = "chr6", start = 3.5e+07, end = 4e+07)
+
+plotTracks(txTr)
+
+biomTrack <- BiomartGeneRegionTrack(genome = "hg19", 
+                                    chromosome = 6, 
+                                    start = 20000000, end = 20100000, 
+                                    name = "ENSEMBL")
+
+plotTracks(biomTrack, collapseTranscripts = "longest", transcriptAnnotation = "symbol", fill = "black")
+
+
+```
+
+```
+library(readxl)
+hNSC21.5_24h_MEKi <- read_excel("/projects/marralab_cic_prj/Weissman_et_al/paper_peaks/allpeaks.xls", sheet = 3) %>% 
+  select(1:3)
+
+hNSC18.5_24h_MEKi <- read_excel("/projects/marralab_cic_prj/Weissman_et_al/paper_peaks/allpeaks.xls", sheet = 2) %>% 
+  select(1:3)
+
+G144_24h_MEKi <- read_excel("/projects/marralab_cic_prj/Weissman_et_al/paper_peaks/allpeaks.xls", sheet = 5) %>% 
+  select(1:3) %>% 
+  mutate(Start = as.integer(Start))
+
+write_tsv(hNSC21.5_24h_MEKi, "/projects/marralab_cic_prj/Weissman_et_al/paper_peaks/hNSC21.5_24h_MEKi.bed", col_names = F)
+write_tsv(hNSC18.5_24h_MEKi, "/projects/marralab_cic_prj/Weissman_et_al/paper_peaks/hNSC18.5_24h_MEKi.bed", col_names = F)
+write_tsv(G144_24h_MEKi, "/projects/marralab_cic_prj/Weissman_et_al/paper_peaks/G144_24h_MEKi.bed", col_names = F)
+
+```
+
+```
+mq0.01_i_G144_tss <- fread(str_c(wd, "A77581/peaks/mq0.01_i_G144_tss.bed"), 
+                           col.names = c("chr", "start", "end", "X1", "X2", "X3", "fold_change", "log10_pval", "log10_qval", "X4", "X5", "X6", "X7",
+                                         "overlap", "X8", "X9", "X10", "strand", "ens_gene", "gene_name", "ens_transcript", "X11", "X12", "tss", "X13")) %>% 
+  select(-contains("X")) %>% 
+  mutate(peak_size = abs(start - end),
+         peak_center = (end + start) / 2, 
+         dist_to_tss = abs(peak_center - tss))
+
+NHA_DE_genes_peaks <- NHA_DE_genes %>%
+  filter(gene_ID %in% mq0.01_i_G144_tss$gene_name)
+
+F8_DE_genes_peaks <- F8_DE_genes %>%
+  filter(gene_ID %in% mq0.01_i_G144_tss$gene_name)
+
+f_i_G144_tss <- fread(str_c(wd, "A77581/peaks/f_i_G144_tss.bed"), 
+                      col.names = c("chr", "start", "end", "log10_pval", "X4", "X5", "X6", "overlap", "X8", "X9", "X10", 
+                                    "strand", "ens_gene", "gene_name", "ens_transcript", "X11", "X12", "tss", "X13")) %>% 
+  select(-contains("X")) %>% 
+  mutate(peak_size = abs(start - end),
+         peak_center = (end + start) / 2, 
+         dist_to_tss = abs(peak_center - tss))
+
+f_i_G144.bed <- f_i_G144_tss %>%
+  select(chr, start, end) %>%
+  unique() %>% 
+  mutate(chr = str_c("chr", chr))
+
+f_i_G144_anno <- annotate_peaks(f_i_G144.bed)
+
+write_delim(f_i_G144.bed, str_c(wd, "merged_peaks/rep2_f_i_G144.bed"), col_names = F)
+
+ggplot(f_i_G144_anno, aes(x = log10(abs(distanceToTSS) + 1)))  +
+  geom_density(size = 0.8, alpha = 0.4, col = "gray10", fill = "gray10") +
+  labs(x = "Distance to TSS (log10)", y = "Density") +
+  theme(axis.text = element_text(size = 20),
+        axis.title = element_text(size = 24))  
+
+ggplot(f_i_G144_anno, aes(x = fct_infreq(annotation))) +
+  geom_bar(aes(y = ..prop.., group = 1), width = 0.7, fill = "gray30") +
+  labs(x = NULL, y = "Fraction of Peaks") +
+  theme(axis.text = element_text(size = 20),
+        axis.text.x = element_text(angle = 45, hjust = 1),
+        axis.title = element_text(size = 24))
+```
+
+# Plot metaplots of CIC-ChIP and histone mark ChIP signal around CIC peaks
+```
+read_padbin_cov <- function(x, flagstats) {
+  sample <- str_replace(str_split(x, simplify = T, pattern = "/")[, 6], "^f_i_G144_padbin_(.*)_cov.bed$", "\\1")
+  mapped <- as.numeric(flagstats[flagstats$lib == sample, ]$mapped)
+
+  df <- fread(x, col.names = c("chr", "start", "end", "id", "cov")) %>% 
+    mutate(sample = sample,
+           # position is the bin number
+           pos = as.numeric(str_replace(id, "_", "")),
+           # our peaks are padded into 40 bins of 100bp, the following = the distance of bin center to peak center in kb
+           dist = (-50 - (100 * (20 - pos))) / 1000,
+           spkm = (cov * 1e9) / (mapped * 100))
+  
+  return(df)
+}
+
+rep2_f_i_G144_padbin_2kb_files <- str_c(wd, "merged_peaks/", str_subset(dir(str_c(wd, "merged_peaks")), "^f_i_G144_padbin_.*_cov.*$"))
+rep2_f_i_G144_padbin_2kb <- rep2_f_i_G144_padbin_2kb_files %>% 
+  map(read_padbin_cov, flagstats) %>% 
+  bind_rows()
+
+smooth_padbin_peaks <- function(x) {
+  df <- x %>% 
+    separate(sample, c("cell_line", "rep", "mark")) %>% 
+    group_by(dist, cell_line, mark) %>% 
+    summarize(mean_spkm = mean(spkm))
+  
+  return(df)
+}
+
+rep2_f_i_G144_padbin_2kb_cic <- fread(str_c(wd, "merged_peaks/rep2_f_i_G144_padbin_2kb_cov_tss_both.bed"), 
+                                      col.names = c("chr", "start", "end", "id", "cov", "X1", "X2", "X3", "strand",
+                                                    "ensg", "gene_name", "X4", "X5", "X6", "tss", "dist_to_tss", "cov_input")) %>% 
+  select(-contains("X")) %>% 
+  mutate(pos = as.numeric(str_replace(id, "_", "")),
+         dist = (-50 - (100 * (20 - pos))) / 1000,
+         spkm = (cov * 1e9) / (as.numeric(flagstats_1[flagstats_1$lib == "A77581", ]$mapped * 100)),
+         spkm_input = (cov_input * 1e9) / (as.numeric(flagstats_1[flagstats_1$lib == "A77582", ]$mapped * 100)))
+
+rep2_f_i_G144_padbin_2kb_cic_smooth <- rep2_f_i_G144_padbin_2kb_cic %>% 
+  mutate(anno = if_else(abs(dist_to_tss) < 5000, "promoter (<= 5kb to tss)", "distal (>5kb to tss)")) %>% 
+  group_by(dist, anno) %>% 
+  summarize(ChIP = mean(spkm), Input = mean(spkm_input)) %>% 
+  gather(type, mean_spkm, ChIP, Input)
+
+ggplot(rep2_f_i_G144_padbin_2kb_cic_smooth, aes(dist, mean_spkm, color = type)) +
+  geom_path(size = 1) +
+  facet_wrap(~anno)
+
+cic_pos_genes_padbin_2kb_promoter <- rep2_f_i_G144_padbin_2kb_promoter %>% 
+  filter(gene_name %in% cic_pos_genes) %>% 
+  smooth_padbin_peaks() %>% 
+  mutate(CIC = if_else(cell_line %in% c("NHA", "F8"), "WT", "KO") %>% factor(levels = c("WT", "KO")),
+         IDH1 = if_else(cell_line %like% "NHA", "IDH1-WT", "IDH1-R132H"))
+
+pdf(file = str_c(figs_path, "H-mod coverage around CIC peaks (f_i_G144).pdf"), height = 6, width = 12)
+ggplot(cic_pos_genes_padbin_2kb_promoter %>% filter(mark != "input"), aes(dist, mean_spkm, col = cell_line)) +
+  geom_path(size = 1) +
+  facet_wrap(fct_rev(as.factor(IDH1)) ~ mark, nrow = 2, ncol = 6, scales = "free") +
+  scale_colour_manual(values = c("mediumblue", "firebrick1", "firebrick3", "cornflowerblue", "tomato", "tomato3")) +
+  labs(x = "Distance to Peak Center (Kb)", y = "Mean SPKM", col = NULL) + 
+  guides(colour = guide_legend(nrow = 1)) + 
+  theme(strip.text = element_blank(),
+        axis.title = element_text(size = 18),
+        legend.text = element_text(size = 16),
+        legend.position = "bottom")
+dev.off()
+
+rep2_f_i_G144_padbin_2kb_all <- rep2_f_i_G144_padbin_2kb %>% 
+  left_join(rep2_f_i_G144_padbin_2kb_cic %>% select(-c(cov, spkm)))
+
+rep2_f_i_G144_padbin_2kb_smooth <- smooth_padbin_peaks(rep2_f_i_G144_padbin_2kb_all)
+
+rep2_f_i_G144_padbin_2kb_promoter <- rep2_f_i_G144_padbin_2kb_all %>% 
+  filter(abs(dist_to_tss) < 2000) %>% 
+  mutate(dist = if_else(strand == -1, dist * -1, dist))
+
+rep2_f_i_G144_padbin_2kb_promoter_smooth <- smooth_padbin_peaks(rep2_f_i_G144_padbin_2kb_promoter) %>% 
+  mutate(CIC = if_else(cell_line %in% c("NHA", "F8"), "WT", "KO") %>% factor(levels = c("WT", "KO")),
+         IDH1 = if_else(cell_line %like% "NHA", "IDH1-WT", "IDH1-R132H"))
+
+pdf(file = str_c(figs_path, "H-mod coverage around CIC peaks at promoters (f_i_G144).pdf"), height = 6, width = 12)
+ggplot(rep2_f_i_G144_padbin_2kb_promoter_smooth %>% filter(mark != "input"), aes(dist, mean_spkm, col = cell_line)) +
+  geom_path(size = 1) +
+  facet_wrap(fct_rev(as.factor(IDH1)) ~ mark, nrow = 2, ncol = 6, scales = "free") +
+  scale_colour_manual(values = c("mediumblue", "firebrick1", "firebrick3", "cornflowerblue", "tomato", "tomato3")) +
+  labs(x = "Distance to Peak Center (Kb)", y = "Mean SPKM", col = NULL) + 
+  guides(colour = guide_legend(nrow = 1)) +
+  theme(strip.text = element_blank(),
+        axis.title = element_text(size = 18),
+        legend.text = element_text(size = 16),
+        legend.position = "bottom")
+dev.off()
+
+rep2_f_i_G144_padbin_2kb_promoter_up <- rep2_f_i_G144_padbin_2kb_all %>% 
+  filter(abs(dist_to_tss) < 2000, gene_name %in% select(filter(f_i_G144_F8_DE, direction == "up"), gene_ID)) %>% 
+  mutate(dist = if_else(strand == -1, dist * -1, dist))
+
+rep2_f_i_G144_padbin_2kb_distal <- rep2_f_i_G144_padbin_2kb_all %>% 
+  filter(abs(dist_to_tss) > 5000)
+
+rep2_f_i_G144_padbin_2kb_distal_smooth <- smooth_padbin_peaks(rep2_f_i_G144_padbin_2kb_distal) %>% 
+  mutate(CIC = if_else(cell_line %in% c("NHA", "F8"), "WT", "KO") %>% factor(levels = c("WT", "KO")),
+         IDH1 = if_else(cell_line %like% "NHA", "IDH1-WT", "IDH1-R132H"))
+
+ggplot(rep2_f_i_G144_padbin_2kb_distal_smooth %>% filter(mark != "input"), aes(dist, mean_spkm, col = cell_line)) +
+  geom_path(size = 1) +
+  facet_wrap(IDH1 ~ mark, nrow = 2, ncol = 6, scales = "free")
+
+rep2_f_i_G144_padbin_2kb_smooth_final <- rep2_f_i_G144_padbin_2kb_smooth %>% 
+  group_by(dist, cell_line) %>% 
+  mutate(mean_spkm_minus_input = mean_spkm - last(mean_spkm)) %>% 
+  ungroup() %>% 
+  mutate(CIC = if_else(cell_line %in% c("NHA", "F8"), "WT", "KO") %>% factor(levels = c("WT", "KO")),
+         IDH1 = if_else(cell_line %like% "NHA", "IDH1-WT", "IDH1-R132H"))
+
+ggplot(rep2_f_i_G144_padbin_2kb_smooth_final %>% filter(mark != "input"), aes(dist, mean_spkm_minus_input, col = cell_line)) +
+  geom_path(aes(linetype = IDH1), size = 1) +
+  facet_wrap(~ mark, nrow = 2, ncol = 6, scales = "free")
+
+ggplot(rep2_f_i_G144_padbin_2kb_smooth_final %>% filter(mark != "input"), aes(dist, mean_spkm, col = cell_line)) +
+  geom_path(size = 1) +
+  facet_wrap(IDH1~ mark, nrow = 2, ncol = 6, scales = "free")
+
+rep2_f_i_G144_padbin_2kb_me <- fread(str_c(wd, "merged_peaks/rep2_f_i_G144_padbin_2kb_me_tss.bed"),
+                                     col.names = c("chr", "start", "end", "id", "X1", "X2", "X3", "X4", "X5", "X6", "sample", "fme",
+                                                   "X9", "X10", "X11", "strand", "ensg", "gene_name", "X12", "X13", "X14", "tss", "dist_to_tss")) %>% 
+  select(-contains("X"))
+
+rep2_f_i_G144_padbin_2kb_me_promoter <- rep2_f_i_G144_padbin_2kb_me %>% 
+  mutate(pos = as.numeric(str_replace(id, "_", "")),
+         dist = (-50 - (100 * (20 - pos))) / 1000,
+         dist = if_else(strand == -1, dist * -1, dist)) %>% 
+  separate(sample, c("cell_line", "rep"), sep = "_") %>% 
+  filter(abs(dist_to_tss) <= 2000) %>% 
+  group_by(cell_line, dist) %>% 
+  summarize(mean_fme = mean(fme)) %>%
+  mutate(CIC = if_else(cell_line %in% c("NHA", "F8"), "WT", "KO") %>% factor(levels = c("WT", "KO")),
+         IDH1 = if_else(cell_line %like% "NHA", "IDH1-WT", "IDH1-R132H"))
+
+ggplot(rep2_f_i_G144_padbin_2kb_me_promoter, aes(dist, mean_fme, col = cell_line)) +
+  geom_path(size = 1) +
+  facet_wrap(~ fct_rev(as.factor(IDH1)))
+
+rep2_f_i_G144_padbin_2kb_me_distal <- rep2_f_i_G144_padbin_2kb_me %>% 
+  mutate(pos = as.numeric(str_replace(id, "_", "")),
+         dist = (-50 - (100 * (20 - pos))) / 1000) %>% 
+  separate(sample, c("cell_line", "rep"), sep = "_") %>% 
+  filter(abs(dist_to_tss) > 5000) %>% 
+  group_by(cell_line, dist) %>% 
+  summarize(mean_fme = mean(fme)) %>%
+  mutate(CIC = if_else(cell_line %in% c("NHA", "F8"), "WT", "KO") %>% factor(levels = c("WT", "KO")),
+         IDH1 = if_else(cell_line %like% "NHA", "IDH1-WT", "IDH1-R132H"))
+
+ggplot(rep2_f_i_G144_padbin_2kb_me_distal, aes(dist, mean_fme, col = cell_line)) +
+  geom_path(size = 1) +
+  facet_wrap(~ fct_rev(as.factor(IDH1)))
+
+rep2_f_i_G144_padbin_2kb_me_pos <- rep2_f_i_G144_padbin_2kb_me %>% 
+  filter(gene_name %in% cic_pos_genes) %>% 
+  mutate(pos = as.numeric(str_replace(id, "_", "")),
+         dist = (-50 - (100 * (20 - pos))) / 1000,
+         dist = if_else(strand == -1, dist * -1, dist)) %>% 
+  separate(sample, c("cell_line", "rep"), sep = "_") %>% 
+  filter(abs(dist_to_tss) <= 5000) %>% 
+  group_by(cell_line, dist) %>% 
+  summarize(mean_fme = mean(fme)) %>%
+  mutate(CIC = if_else(cell_line %in% c("NHA", "F8"), "WT", "KO") %>% factor(levels = c("WT", "KO")),
+         IDH1 = if_else(cell_line %like% "NHA", "IDH1-WT", "IDH1-R132H"))
+
+ggplot(rep2_f_i_G144_padbin_2kb_me_pos, aes(dist, mean_fme, col = cell_line)) +
+  geom_path(size = 1) +
+  facet_wrap(~ fct_rev(as.factor(IDH1)))
+
+plot_cov_across_peaks <- function(x) {
+  p <- ggplot(x, aes(dist, mean_logrpm, col = type)) +
+    geom_path(size = 1) +
+    xlim(c(-2, 2)) +
+    facet_wrap(~sample) +
+    scale_color_manual(values = c("steelblue", "snow3")) +
+    labs(x = "Distance from Peak Center (Kb)", y = "Normalized Coverage (Log10)", col = NULL) +
+    theme(legend.position = "bottom") +
+    theme_1
+    
+  return(p)
+}
+
+pdf(file = str_c(figs_path, "/first_submission/cov_across_f_peaks.pdf"), width = 10)
+plot_cov_across_peaks(f_padbin_peaks_1_smooth)
+dev.off()
+```
+
+```{r}
+#upset plot for Sugi
+
+library(UpSetR)
+movies <- read.csv(system.file("extdata", "movies.csv", package = "UpSetR"), 
+    header = T, sep = ";")
+
+
+upset_data <- read_csv("/projects/sdlee_prj/CIC_prj/ChIP/sugi_paper/upset_data.csv")
+upset_list <- list(`CIC-IP` = upset_data %>% filter(IP == "CIC-IP") %>% select(Interactor) %>% unlist(),
+                   `ARID1A-IP` = upset_data %>% filter(IP == "ARID1A-IP") %>% select(Interactor) %>% unlist(),
+                   `SMARCA2-IP` = upset_data %>% filter(IP == "SMARCA2-IP") %>% select(Interactor) %>% unlist())
+
+upset(fromList(upset_list), point.size = 5, line.size = 1.5, order.by = "freq", text.scale = 2)
+
+upset(movies, nsets = 6, number.angles = 30, point.size = 3.5, line.size = 2, 
+    mainbar.y.label = "Genre Intersections", sets.x.label = "Movies Per Genre", 
+    text.scale = c(1.3, 1.3, 1, 1, 2, 0.75))
+
+upset(movies,attribute.plots=list(gridrows=60,plots=list(list(plot=scatter_plot, x="ReleaseDate", y="AvgRating"),
+list(plot=scatter_plot, x="ReleaseDate", y="Watches"),list(plot=scatter_plot, x="Watches", y="AvgRating"),
+list(plot=histogram, x="ReleaseDate")), ncols = 2))
+```
+
+```{r}
+all_cpg_c5 <- readRDS("/projects/marralab_cic_prj/wgbs/R_objects/all_cpg_c5.rds")
+
+F8_rep1_cpg_c5 <- all_cpg_c5 %>% 
+  filter(lib %in% c("F8_rep1", "F8A2_rep1", "F8E10_rep1"))
+
+write_tsv(F8_rep1_cpg_c5, "/projects/marralab_cic_prj/wgbs/F8_rep1_cpg.bed", col_names = F)
+
+F8_diff_me_cpgs_q0.01_d25_df <- readRDS("/projects/marralab_cic_prj/wgbs/R_objects/F8_diff_me_cpgs_q0.01_d25_df.rds")
+
+overlap_DE_genes_q0.01 <- rbind(NHA_DE_genes_q0.01 %>% mutate(cell_line = "NHA"), F8_DE_genes_q0.01 %>% mutate(cell_line = "F8"))
+
+
+F8_DE_unique <- F8_DE_genes_q0.01 %>% filter(!(gene_ID %in% overlap_DE_genes_q0.01$gene_ID))
+
+```
+
+```{r}
+rep2_i_G144 <- fread(str_c(wd, "rep2_i_G144/union_peaks.bed"), col.names = c("chr", "start", "end")) %>% 
+  anno_peaks()
+
+rep2_i_G144_promoter <- rep2_i_G144 %>% 
+  filter(annotation == "Promoter")
+
+CIC_target_DE_genes_q0.01 <- overlap_DE_genes_q0.01 %>% 
+  filter(gene_ID %in% rep2_i_G144_promoter$SYMBOL)
+
+CIC_target_DE_genes_q0.01_up_NHA <- CIC_target_DE_genes_q0.01 %>% 
+  filter(direction == "up", log2FoldChange >= 1, cell_line == "NHA")
+
+CIC_target_DE_genes_q0.01_up_F8 <- CIC_target_DE_genes_q0.01 %>% 
+  filter(direction == "up", log2FoldChange >= 1, cell_line == "F8")
+
+h3k27me3_samples <- fread("/projects/marralab_cic_prj/histone_mod_chip/samples", header = F) %>% unlist() %>% as.character() %>% str_replace("h3k4me1", "h3k27me3")
+a <- fread("/projects/marralab_cic_prj/histone_mod_chip/macs2_mpeaks/h3k27me3/union_rpkm.tab", 
+           col.names = c("chr", "start", "end", h3k27me3_samples)) %>% 
+  filter(chr %in% c(1:22, "X", "Y")) %>% 
+  anno_peaks()
+
+h3k27ac_samples <- fread("/projects/marralab_cic_prj/histone_mod_chip/samples", header = F) %>% unlist() %>% as.character() %>% str_replace("h3k4me1", "h3k27ac")
+b <- fread("/projects/marralab_cic_prj/histone_mod_chip/macs2_mpeaks/h3k27ac/union_rpkm.tab", 
+           col.names = c("chr", "start", "end", h3k27ac_samples)) %>% 
+  filter(chr %in% c(1:22, "X", "Y")) %>% 
+  anno_peaks()
+
+plot_rpkm <- function(x, line, dir) {
+  samples <- x %>% select(contains("h3")) %>% colnames()
+  genes <- CIC_target_DE_genes_q0.01 %>% 
+    filter(direction == dir, abs(log2FoldChange) >= 1, cell_line == line)
+  
+  df <- x %>% 
+    filter(annotation == "Promoter", SYMBOL %in% genes$gene_ID) %>% 
+    gather(sample, rpkm, samples) %>% 
+    separate(sample, c("cell_line", "rep", "mark"), sep = "_") %>%
+    mutate(id = str_c(seqnames, ":", start, ":", end),
+           CIC = if_else(cell_line %in% c("NHA", "F8"), "CIC_WT", "CIC_KO"),
+           IDH1 = if_else(cell_line %like% "NHA", "IDH1_WT", "IDH1_R132H")) %>% 
+    filter(cell_line %like% line) %>% 
+    group_by(id, SYMBOL, CIC) %>% 
+    summarize(mean_rpkm = mean(rpkm)) %>% 
+    select(gene_ID = SYMBOL, everything()) %>% 
+    na.omit() %>% 
+    ungroup() %>% 
+    mutate(CIC = as.factor(CIC))
+  
+  return(df)
+}
+```
+
+
+```{r}
+f_rep2_i_G144 <- fread("/projects/marralab_cic_prj/tf_first_analysis/A77581/peaks/f_i_G144.bed",
+                       col.names = c("chr", "start", "end", "log10_pval", "Weiss_chr", "Weiss_start", "Weiss_end", "overlap"))
+
+TxDb_ens <- makeTxDbFromGFF("/projects/marralab_cic_prj/shared_objects/Homo_sapiens.GRCh37.75.gtf",
+                            dataSource = "ensembl",
+                            organism = "Homo sapiens")
+library(AnnotationHub)
+
+if (!requireNamespace("BiocManager", quietly=TRUE))
+    install.packages("BiocManager")
+BiocManager::install("annotatr")
+
+anno_ucsc_hg19 <- function(x) {
+  require(ChIPseeker)
+  require(TxDb.Hsapiens.UCSC.hg19.knownGene)
+  txdb <- TxDb.Hsapiens.UCSC.hg19.knownGene
+  
+  if(str_detect(x$chr, "chr") == F) {
+    x <- x %>% mutate(chr = str_c("chr", chr))
+  }
+  
+  df <- x %>% 
+    makeGRangesFromDataFrame(keep.extra.columns = T) %>% 
+    annotatePeak(tssRegion = c(-3000, 3000), TxDb = txdb, annoDb = "org.Hs.eg.db") %>% 
+    as.data.frame() %>% 
+    mutate(annotation = str_replace(annotation, " \\(.*\\)", ""),
+           geneStrand = if_else(geneStrand == 1, "+", "-"))
+  
+  return(df)
+}
+```
+
+Assess coverage (IP vs input) in peaks and across peaks using overlapping peaks between rep2 and G144 (Weissmann et al)
+```{r}
+theme_1 <- theme(axis.text = element_text(size = 15),
+        axis.title = element_text(size = 18),
+        strip.text = element_text(size = 16, face = "bold"),
+        legend.title = element_text(size = 17, face = "bold"),
+        legend.text = element_text(size = 15),
+        panel.background = element_rect(fill = "white"),
+        panel.grid.major = element_line(linetype = "dashed", colour = "gainsboro"))
+
+cic_targets <- c("ETV4", "ETV5", "DUSP4", "GPR3", "SPRY4")
+
+# coverage in FindER peaks (rpkm)
+rep2_f_i_G144_rpkm <- fread("/projects/marralab_cic_prj/tf_first_analysis/rep2_f_i_G144_rpkm.tab",
+                            col.names = c("chr", "start", "end", "NHA_rep1_chip", "NHA_rep1_input", "NHA_rep2_chip", "NHA_rep2_input")) %>% 
+  unique() %>% 
+  gather(sample, rpkm, contains("NHA")) %>%
+  mutate(rep = if_else(sample %like% "rep1", "Rep 1", "Rep 2"),
+         type = if_else(sample %like% "chip", "ChIP", "Input")) %>%
+  select(-sample) %>% 
+  spread(type, rpkm) %>%
+  mutate(ChIP = log2(ChIP + 1), Input = log2(Input + 1)) %>% 
+  anno_ucsc_hg19()
+
+ggplot(rep2_f_i_G144_rpkm, aes(Input, ChIP)) +
+  geom_point(alpha = 0.7, col = "gray30") +
+  geom_point(data = subset(rep2_f_i_G144_rpkm, SYMBOL %in% cic_targets), size = 2, col = "coral1") +
+  geom_text_repel(data = subset(rep2_f_i_G144_rpkm, SYMBOL %in% cic_targets), aes(label = SYMBOL), 
+									col = "coral1", size = 4, fontface = "bold", arrow = arrow(length = unit(0.02, "npc"))) +
+  facet_wrap(~rep) +
+  geom_abline(slope = 1, intercept = 0, col = "black", linetype = "dashed") +
+  coord_fixed(ratio = 1) +
+  xlim(0, 11.5) + ylim(0, 11.5) +
+  labs(x = "Log2 RPKM Input", y = "Log2 RPKM IP") +
+  theme_1
+
+# coverage in MACS2 peaks (rpkm)
+rep2_mq0.01_i_G144_rpkm <- fread("/projects/marralab_cic_prj/tf_first_analysis/rep2_mq0.01_i_G144_rpkm.tab",
+                                 col.names = c("chr", "start", "end", "NHA_rep1_chip", "NHA_rep1_input", "NHA_rep2_chip", "NHA_rep2_input")) %>% 
+  unique() %>% 
+  gather(sample, rpkm, contains("NHA")) %>%
+  mutate(rep = if_else(sample %like% "rep1", "Rep 1", "Rep 2"),
+         type = if_else(sample %like% "chip", "ChIP", "Input")) %>%
+  select(-sample) %>% 
+  spread(type, rpkm) %>%
+  mutate(ChIP = log2(ChIP + 1), Input = log2(Input + 1)) %>% 
+  anno_ucsc_hg19()
+
+ggplot(rep2_mq0.01_i_G144_rpkm, aes(Input, ChIP)) +
+  geom_point(alpha = 0.7, col = "gray30") +
+  geom_point(data = subset(rep2_f_i_G144_rpkm, SYMBOL %in% cic_targets), size = 2, col = "coral1") +
+  geom_text_repel(data = subset(rep2_f_i_G144_rpkm, SYMBOL %in% cic_targets), aes(label = SYMBOL), 
+									col = "coral1", size = 4, fontface = "bold", arrow = arrow(length = unit(0.02, "npc"))) +
+  facet_wrap(~rep) +
+  geom_abline(slope = 1, intercept = 0, col = "black", linetype = "dashed") +
+  coord_fixed(ratio = 1) +
+  xlim(0, 11.5) + ylim(0, 11.5) +
+  labs(x = "Log2 RPKM Input", y = "Log2 RPKM IP") +
+  theme_1
+
+# Coverage across FindER peaks
+smooth_padbin_rpkm <- function(x, caller = "FindER") {
+  pad <- str_c(str_replace(x, "kb", ""), "000") %>% as.numeric()
+  n_bins <- ifelse(pad == 2000, 40, ifelse(pad == 5000, 100, 200))
+  
+  prefix <- ifelse(caller == "FindER", "f_i_G144_", "mq0.01_i_G144_")
+  
+  df <- fread(str_c("/projects/marralab_cic_prj/tf_first_analysis/A77581/peaks/", prefix, x, "_rpkm.tab"),
+              col.names = c("chr", "start", "end", "NHA_rep1_chip", "NHA_rep1_input", "NHA_rep2_chip", "NHA_rep2_input"))
+  
+  n_peaks = nrow(df) / n_bins
+  
+  df <- df %>% 
+    mutate(pos = rep(seq(1:n_bins), n_peaks),
+           dist = (-50 - (100 * ((n_bins / 2) - pos))) / 1000) %>%
+    gather(sample, rpkm, contains("NHA")) %>%
+    group_by(sample, dist) %>% 
+    summarize(mean_rpkm = mean(rpkm)) %>%
+    ungroup() %>% 
+    mutate(type = if_else(sample %like% "chip", "ChIP", "Input"),
+           sample = str_replace(sample, "(NHA_rep.)_.*", "\\1"),
+           tool = caller)
+  
+  return(df)
+}
+
+plot_rpkm_profile <- function(x) {
+  p <- ggplot(x, aes(dist, mean_rpkm, col = type)) +
+    geom_path(aes(linetype = sample), size = 1) +
+    scale_color_manual(values = c("steelblue", "gray")) +
+    facet_wrap(~tool) +
+    labs(x = "Distance to Peak Center (Kb)", y = "Mean RPKM", col = NULL, linetype = NULL) +
+    theme_1
+
+  return(p)
+}
+
+rep2_i_G144_2kb_smooth <- rbind(smooth_padbin_rpkm("2kb"), smooth_padbin_rpkm("2kb", "Macs2"))
+rep2_i_G144_5kb_smooth <- rbind(smooth_padbin_rpkm("5kb"), smooth_padbin_rpkm("5kb", "Macs2"))
+rep2_i_G144_10kb_smooth <- rbind(smooth_padbin_rpkm("10kb"), smooth_padbin_rpkm("10kb", "Macs2"))
+
+plot_rpkm_profile(rep2_i_G144_2kb_smooth)
+plot_rpkm_profile(rep2_i_G144_5kb_smooth)
+plot_rpkm_profile(rep2_i_G144_10kb_smooth)
+```
+
+# Histone mod coverage across rep2_i_G144
+```{r}
+hmod_samples <- str_subset(str_subset(dir(wd), "NHA|F8"), "h3")
+
+smooth_padbin_hmod_rpkm <- function(x, caller = "FindER", filter = "proximal") {
+  pad <- str_c(str_replace(x, "kb", ""), "000") %>% as.numeric()
+  n_bins <- ifelse(pad == 2000, 40, ifelse(pad == 5000, 100, 200))
+  
+  prefix <- ifelse(caller == "FindER", "f_i_G144_padbin", "mq0.01_i_G144_padbin")
+  
+  df <- fread(str_c("/projects/marralab_cic_prj/tf_first_analysis/A77581/peaks/", prefix, x, "_hmod_rpkm.tab"),
+              col.names = c("chr", "start", "end", hmod_samples))
+  
+  n_peaks = nrow(df) / n_bins
+  
+  df <- df %>% 
+    mutate(pos = rep(seq(1:n_bins), n_peaks),
+           dist = (-50 - (100 * ((n_bins / 2) - pos))) / 1000) %>% 
+    anno_ucsc_hg19()
+  
+  if(filter == "proximal") {
+    df2 <- df %>% 
+      filter(abs(distanceToTSS) <= (2000 + pad))
+  } else {
+    df2 <- df %>% 
+      filter(abs(distanceToTSS) > (2000 + pad))
+  }
+  
+  df3 <- df2 %>% 
+    gather(sample, rpkm, contains("rep")) %>% 
+    separate(sample, c("cell_line", "rep", "mark"), sep = "_") %>%
+    group_by(cell_line, mark, dist) %>%
+    summarize(mean_rpkm = mean(rpkm)) %>% 
+    mutate(CIC = if_else(cell_line %in% c("NHA", "F8"), "CIC_WT", "CIC_KO"),
+           IDH1 = if_else(cell_line %like% "NHA", "IDH1-WT", "IDH1-R132H"),
+           tool = caller)
+  
+  return(df3)
+}
+
+a <- smooth_padbin_hmod_rpkm("5kb")
+b <- smooth_padbin_hmod_rpkm("5kb", filter = "distal")
+
+plot_hmod_rpkm_profile(a, "IDH1-WT")
+plot_hmod_rpkm_profile(a, "IDH1-R132H")
+
+plot_hmod_rpkm_profile(b, "IDH1-WT")
+plot_hmod_rpkm_profile(b, "IDH1-R132H")
+
+c <- smooth_padbin_hmod_rpkm("5kb", caller = "Macs2")
+d <- smooth_padbin_hmod_rpkm("5kb", caller = "Macs2", filter = "distal")
+
+plot_hmod_rpkm_profile(c, "IDH1-WT")
+plot_hmod_rpkm_profile(c, "IDH1-R132H")
+
+plot_hmod_rpkm_profile(d, "IDH1-WT")
+plot_hmod_rpkm_profile(d, "IDH1-R132H")
+
+plot_hmod_rpkm_profile <- function(x, IDH1_status) {
+  p <- ggplot(x %>% filter(IDH1 == IDH1_status), aes(dist, mean_rpkm, col = cell_line)) +
+    geom_path(size = 1, alpha = 0.7) +
+    facet_wrap(~mark, scales = "free", nrow = 1) +
+    scale_color_manual(values = c("darkblue", "tomato", "firebrick1")) +
+    labs(x = "Distance to Peak Center (Kb)", y = "Mean RPKM", col = NULL, linetype = NULL) +
+    theme_1
+  
+  return(p)
+}
+
+rep2_i_G144_2kb_hmod_smooth <- rbind(smooth_padbin_hmod_rpkm("2kb"), smooth_padbin_hmod_rpkm("2kb", caller = "Macs2"))
+rep2_i_G144_5kb_hmod_smooth <- rbind(smooth_padbin_hmod_rpkm("5kb"), smooth_padbin_hmod_rpkm("5kb", caller = "Macs2"))
+rep2_i_G144_10kb_hmod_smooth <- rbind(smooth_padbin_hmod_rpkm("10kb"), smooth_padbin_hmod_rpkm("10kb", caller = "Macs2"))
+
+plot_hmod_rpkm_profile(rep2_i_G144_10kb_hmod_smooth, "Macs2", "IDH1-R132H")
+
+df <- fread(str_c("/projects/marralab_cic_prj/tf_first_analysis/A77581/peaks/mq0.01_i_G144_padbin5kb_hmod_rpkm.tab"),
+              col.names = c("chr", "start", "end", hmod_samples)) %>% 
+  mutate(pos = rep(seq(1:100), n_peaks),
+         dist = (-50 - (100 * ((100 / 2) - pos))) / 1000) %>%
+  gather(sample, rpkm, -c("chr", "start", "end", "dist", "pos")) %>% 
+  anno_ucsc_hg19()
+
+padbin_mapper <- cons_peaks_both_reps %>%
+  mutate(summit_pos_2kb = start + rel_summit_pos - 2000) %>% 
+  select(chr, summit_pos_2kb)
+
+df2 <- fread(str_c("/projects/marralab_cic_prj/tf_first_analysis/A77581/peaks/mq0.01_i_G144_padbin5kb_hmod_rpkm.tab"),
+              col.names = c("chr", "start", "end", hmod_samples)) %>% 
+  mutate(pos = rep(seq(1:100), n_peaks),
+         dist = (-50 - (100 * ((100 / 2) - pos))) / 1000)
+
+mq0.01_i_G144 <- fread("/projects/marralab_cic_prj/tf_first_analysis/A77581/peaks/mq0.01_i_G144.bed") %>% 
+  select(chr = 1, start = 2, end = 3)
+
+padbin_mapper <- mq0.01_i_G144 %>%
+  mutate(center_pos = ((start + end) / 2 ) - 5000) %>% 
+  select(chr, center_pos)
+
+padbin_mapper_full <- data.frame()
+for(i in 1:nrow(padbin_mapper)) {
+  start <- padbin_mapper$center_pos[i]
+  add <- data.frame(chr = rep(padbin_mapper$chr[i], length(start)), bin_start =  seq(start, start + 9900, 100))
+  padbin_mapper_full <- rbind(padbin_mapper_full, add)
+}
+
+padbin_mapper_full <- data.frame()
+for(i in 1:nrow(padbin_mapper)) {
+  start <- padbin_mapper$summit_pos_2kb[i]
+  add <- data.frame(chr = rep(padbin_mapper$chr[i], length(start)), bin_start =  seq(start, start + 3900, 100))
+  padbin_mapper_full <- rbind(padbin_mapper_full, add)
+}
+```
+
+

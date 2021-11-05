@@ -1,0 +1,1302 @@
+---
+title: "CIC Project: CIC ChIP-seq QC Analysis"
+author: "Stephen Lee"
+date: '`r format(Sys.time(), "%B %d, %Y")`'
+output: github_document
+---
+
+## Table of Contents
+
+----
+
+[**Overview**](#overview)    
+  - [Submissions](#subs)    
+  - [Resources](#refs)    
+  
+[**Pre-processing**](#pre)    
+  - [Setting up directory](#dir)    
+  - [Processing BAM files](#bams)    
+  
+[**Submission 1 QC**](#qc)    
+  - [Flagstats](#stats)    
+  - [Visualizing BigWig Files](#bw)    
+  - [Correlations Between Samples](#corr)    
+  - [Fingerprints](#fprint)    
+  - [Cross Correlation Analysis](#cross)    
+  - [FindER Peaks QC](#fpeaks)    
+  - [MACS2 Peaks QC](#mpeaks)    
+  
+[**Submission 2 QC**](#qc2)    
+  - [Flagstats](#stats2)    
+  - [Generating BigWig Files](#bw2)    
+  - [Correlations Between Samples](#corr2)
+  - [Fingerprints](#fprint2)    
+  - [Cross Correlation Analysis](#cross2)    
+  - [FindER Peak QC](#fpeaks2)     
+  - [MACS2 Peaks QC](#mpeaks2)    
+  
+## **Overview** <a name="overview"></a>
+
+----
+
+The purpose of this experiment is to obtain genome-wide profiles of CIC binding in an IDH-WT and IDH-R132H background. To do this, we performed Chromatin Immunoprecipitation followed by Next Generation Sequencing (ChIP-seq) which involves formaldehyde crosslinking, DNA fragmentation, immunoprecipitation using a CIC specific antibody (Sigma HPA044341), isolation of ChIP'ed DNA and submission to the GSC for library construction and sequencing. DNA fragmentation can be performed via sonication (physical shearing of DNA) or enzymatic digestion using Micrococcal Nuclease (MNase) - with each approach possessing specific advantages and limitations.   
+
+> We first submitted sonicated CIC ChIP samples (prepared by Veronique Leblanc on the NHA cell line). Particular concerns arose from the QC analyses (described below), namely poor consistency between the two replicates and the input samples very much resembling IP samples. We reached a consensus that the primary source for many of these issues was high PCR amplification bias due to the low amount of DNA that was submitted (both samples were below 5ng - the minimum that is recommended by the GSC). The first section of this document will outline the QC analyses that directed us to this conclusion.    
+
+> Based on this conclusion, the logical solution to improve our sequencing result was to provide more ChIP'ed DNA. A simple option was to scale up the sonciation protocol. At the time, Veronique also prepared CIC ChIP samples using MNase and observed that the recovery was ~20-30 fold greater than using sonication though enrichment was also lower (3-5 fold lower as assessed by qPCR for ETV4, GPR3 and other CIC targets). The higher recovery with MNase was attractive due to our desire to also perform CIC ChIP-seq on samples for which material is limited or hard to obtain (i.e. BT054 cell lines, tumour samples). After many optimizations, I submitted CIC ChIP samples prepared using MNase several months later - this submission included the parental IDH-WT NHA and IDH-R132 F8 lines as well as one CIC-knockout cell line for each parental line as an additional control. The second part of this document will describe the sequencing results for this submission.
+
+### **Submissions** <a name="subs"></a>
+
+CIC ChIP samples prepared using sonication (first submission):    
+
+Cell Line  | CIC Status  | IDH1 Status  | Library ID  | Type  | Amount (ng)    
+---------- | ----------- | ------------ | ----------- | ----- | ------------
+NHA        | WT          | WT           | A77579      | ChIP  | 2.052 
+NHA        | WT          | WT           | A77580      | input | 103.32
+NHA        | WT          | WT           | A77581      | ChIP  | 4.475
+NHA        | WT          | WT           | A77582      | input | 37.44
+    
+    
+CIC ChIP samples prepared using MNase digestion:    
+
+Cell Line  | CIC Status  | IDH1 Status  | Library ID  | Type  | Amount (ng)    
+---------- | ----------- | ------------ | ----------- | ----- | ------------
+NHA        | WT          | WT           | A92927      | ChIP  | 151
+NHA        | WT          | WT           | A92928      | input | 360
+NHAA2      | KO          | WT           | A92929      | ChIP  | 125
+NHAA2      | KO          | WT           | A92930      | input | 280
+NHA        | WT          | WT           | A92931      | ChIP  | 78.5
+NHA        | WT          | WT           | A92932      | input | 104
+NHAA2      | KO          | WT           | A92933      | ChIP  | 91.5
+NHAA2      | KO          | WT           | A92934      | input | 91 
+F8         | WT          | R132H        | A92935      | ChIP  | 91
+F8         | WT          | R132H        | A92936      | input | 196.5
+F8E10      | KO          | R132H        | A92937      | ChIP  | 77
+F8E10      | KO          | R132H        | A92938      | input | 232
+F8         | WT          | R132H        | A92939      | ChIP  | 72
+F8         | WT          | R132H        | A92940      | input | 180.5
+F8E10      | KO          | R132H        | A92941      | ChIP  | 92
+F8E10      | KO          | R132H        | A92942      | input | 290
+
+### **Resources** <a name="refs"></a>
+https://www.ncbi.nlm.nih.gov/pmc/articles/PMC3431496/    
+[DeepTools](https://deeptools.readthedocs.io/en/develop/index.html) is a suite of python tools developed for efficient analysis of high-throughput sequencing data. Several QC steps were done using deepTools which can be found in /gsc/software/linux-x86_64-centos6/python-2.7.12/bin.
+
+## **Pre-processing** <a name="pre"></a>
+
+----
+
+### **Setting up directory** <a name="dir"></a>
+
+```
+libs = $(shell cut -f 1 libs.tsv)
+lib_locs = $(shell cat libs.tsv | awk '{print$$1"__"$$2}')
+
+setupdir = $(foreach lib, ${libs}, $(lib)/bam)
+dir : ${setupdir}
+
+# create directory structure
+%/bam :
+       	mkdir $*; mkdir $*/bam; mkdir $*/peaks;
+
+# import gsc bam files
+get_bams = $(foreach lib_loc, ${lib_locs}, $(lib_loc)/bam/gsc.bam)
+getbams : ${get_bams}
+
+%/bam/gsc.bam :
+        lib=$$(echo $* | awk '{ gsub("__.*", ""); print }'); \
+        loc=$$(echo $* | awk '{ gsub(".*__", ""); print }'); \
+        ln -s $${loc} $${lib}/bam/gsc.bam
+```
+
+### **Processing BAM files** <a name="bams"></a>
+
+```
+sort = $(foreach lib, ${libs}, $(lib)/bam/gsc.sorted.bam)
+sortbams : ${sort}
+
+# filter unmapped reads, sort and index
+%/bam/gsc.sorted.bam :
+        samtools view -bF 4 $*/bam/gsc.bam > $*/bam/tmp.bam; \
+        samtools sort $*/bam/tmp.bam $*/bam/gsc.sorted; \
+        samtools index $*/bam/gsc.sorted.bam $*/bam/gsc.sorted.bam.bai; rm $*/bam/tmp.bam
+
+# filter multi-mapping reads (https://wabi-wiki.scilifelab.se/display/KB/Filter+uniquely+mapped+reads+from+a+BAM+file)
+filter_unique_loop = $(foreach lib, ${libs}, $(lib)/bam/gsc.sorted.unique.bam)
+filter_unique : ${filter_unique_loop}
+
+%/bam/gsc.sorted.unique.bam :
+        samtools view -b -q 1 -F 256 $*/bam/gsc.sorted.bam > $*/bam/tmp.bam; \
+        samtools sort $*/bam/tmp.bam $*/bam/gsc.sorted.unique; \
+        samtools index $*/bam/gsc.sorted.unique.bam $*/bam/gsc.sorted.unique.bam.bai; \
+        rm $*/bam/tmp.bam
+
+# remove duplicates for FindER
+rmdup = $(foreach lib, ${libs}, $(lib)/bam/gsc.nodupe.bam)
+rmdupe : ${rmdup}
+
+%/bam/gsc.nodupe.bam :
+        java -jar ${picard_dupe} I=$*/bam/gsc.sorted.bam O=$*/bam/tmp.bam M=$*/bam/dupe.stdout.txt ASSUME_SORTED=true \
+        REMOVE_DUPLICATES=true; \
+        samtools sort $*/bam/tmp.bam $*/bam/gsc.nodupe; \
+        samtools index $@ $@.bai; rm $*/bam/tmp.bam
+```
+
+#### **Load Libraries and Set Path Variables**
+
+```{r, message=F, warning=F}
+library(tidyverse)
+library(data.table)
+library(knitr)
+library(forcats)
+library(cowplot)
+library(ggrepel)
+setwd("/projects/sdlee_prj/sdlee")
+figs_path <- "/projects/sdlee_prj/sdlee/reports/QC/figs/CIC_ChIP/"
+wd <- "/projects/marralab_cic_prj/tf_first_analysis/"
+wd2 <- "/projects/marralab_cic_prj/cic_chip/"
+```
+
+## **First Submission QC** <a name="qc1"></a>
+
+----
+
+### **Flagstats** <a name="stats"></a>
+
+General sequencing metrics such as number of mapped reads can inform on the depth and complexity of our libraries. Here, samtools flagstat was used to obtain these metrics.
+
+```
+flagstat_loop = $(foreach lib, ${libs}, $(lib)/bam/flagstat.txt)
+flagstat : ${flagstat_loop}
+
+%/bam/flagstat.txt :
+        samtools flagstat $*/bam/gsc.bam > $@
+```
+
+Flagstat files were then imported into R and a simple summarizing plot was generated. A metric of library complexity called non-redundant fraction (NRF = number of distinct uniquely mapping reads (i.e. after removing duplicates) / total number of mapped reads) is also calculated here.
+
+```
+read_flagstats <- function(flagstats) {
+	files <- read.delim(flagstats, sep = '\t', header = F, stringsAsFactors = F) %>% 
+		mutate(lib = str_split(flagstats, "/", simplify = T)[, 5]) %>% 
+		group_by(lib) %>% 
+		mutate(total = as.integer(str_replace(first(V1), " .*", "")),
+					 mapped = as.integer(str_replace(nth(V1, 3), " .*", "")),
+					 perc = as.numeric(str_replace(str_replace(nth(V1, 3), ".* \\(", ""), "%:.*", "")),
+					 qc_fail = as.integer(str_replace(str_replace(first(V1), ".*[0-9] [+] ", ""), " in.*", "")),
+					 dupe = as.integer(str_replace(nth(V1, 2), " .*", "")),
+					 NRF = (mapped - dupe) / mapped) %>% 
+		select(-V1) %>% 
+		unique() %>%
+		rowwise() %>%
+		mutate(dupe_perc = dupe / mapped * 100)
+	
+	return(files)
+}
+
+flagstats_1 <- str_c(wd, str_subset(dir(wd), "A7"), "/bam/flagstat.txt") %>% 
+	map(read_flagstats) %>% 
+	bind_rows() %>% 
+  mutate(type = if_else(lib %in% c("A77579", "A77581"), "ChIP", "Input"))
+
+saveRDS(flagstats_1, str_c(wd, "R_objects/flagstats.rds"))
+flagstats <- readRDS(str_c(wd, "R_objects/flagstats.rds"))
+
+flag_m <- function(x) {
+  df <- x %>% 
+    select(-dupe) %>% 
+    melt() %>% 
+    mutate(variable = as.character(variable),
+           variable = case_when(variable == "total" ~ "# QC-passed Reads",
+                                variable == "mapped" ~ "# Mapped Reads",
+                                variable == "perc" ~ "% Reads Mapped",
+                                variable == "qc_fail" ~ "# QC-failed Reads",
+                                variable == "dupe_perc" ~ "% Duplicate Reads",
+                                variable == "NRF" ~ "Non-Redundant Fraction"),
+           variable = factor(variable, levels = c("# Mapped Reads", "% Reads Mapped", "# QC-passed Reads", 
+                                                  "# QC-failed Reads", "% Duplicate Reads", "Non-Redundant Fraction")))
+  
+  return(df)
+}
+
+flagstats_1_m <- flag_m(flagstats_1)
+saveRDS(flagstats_1_m, str_c(wd, "R_objects/flagstats_m.rds"))
+flagstats_m <- readRDS(str_c(wd, "R_objects/flagstats_m.rds"))
+
+pdf(file = str_c(figs_path, "first_submission/flagstats.pdf"), width = 12)
+ggplot(flagstats_m, aes(x = lib, y = value, fill = type)) + 
+  geom_col(width = 0.8, alpha = 0.8, size = 4, position = "dodge") +
+  scale_fill_manual(values = c("steelblue", "snow3")) +
+  facet_wrap(~variable, scales = "free") +
+	labs(x = NULL, y = NULL, fill = NULL) +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.25, hjust = 1),
+        axis.text.y = element_text(size = 13),
+        strip.background = element_rect(fill = "gainsboro", color = "black"),
+        strip.text = element_text(size = 14, color = "black", face = "bold"),
+        legend.text = element_text(size = 14))
+dev.off()
+```
+
+<center><img src="figs/CIC_ChIP/first_submission/flagstats.pdf"">
+<br><a href="figs/CIC_ChIP/first_submission/flagstats.png">(Download pdf)</A></center>    
+
+> All of our samples are well above ENCODE's read depth target of 20 million usable fragments per replicate and a high proportion of reads were mapped for all samples (>85%). We can also note that ChIP samples have a duplicate rate of ~20-25% - a higher duplication rate in ChIP samples relative to input is expected since you are enriching for specific regions (i.e. it is more likely that identical reads will be identified in enriched regions given sufficient sequencing depth). The higher duplication rate could also be attributed to greater PCR duplication rates arising from the low amount of input material that was submitted (~2ng for rep1 and ~4.5ng for rep2) which required additional PCR cycles to obtain sufficient material for library construction (13 cycles vs 8 for our histone ChIP-seq samples). Lastly, the NRF for the two ChIP replicates fall close to 0.75 (an ideal NRF is >0.9 according to ENCODE, an NRF between 0.7 and 0.9 is acceptable) while input samples have an NRF of >0.95. In summary, these metrics do not alarm us of any red flags - but we'll keep in mind that the ChIP libraries have lower complexity than our input samples. 
+
+### **PCR Bottlenecking Coefficient** <a name="pbc"></a>
+
+Another complexity metric is the PCR Bottlenecking Coefficient which is equal to the ratio between the number of positions to which EXACTLY one unique mapping read maps to the number of positions to which AT LEAST one unique mapping read maps, i.e. the number of non-redundant, unique mapping reads. Low PBC values can indicate technical issues such as PCR bias. Here, PBC is calculated using a function taken from the [encodeChIPqc package](https://rdrr.io/github/imbforge/encodeChIPqc/src/R/PBC.R)
+
+```
+PBC <- function(IP) {
+    require(GenomicAlignments)
+    require(data.table)
+
+    aln <- readGAlignments(IP)
+
+    # convert GAlignments object to data.table for fast aggregation
+    aln <- data.table(
+        strand=as.factor(BiocGenerics::as.vector(strand(aln))),
+        seqnames=as.factor(BiocGenerics::as.vector(seqnames(aln))),
+        pos=ifelse(strand(aln) == "+", start(aln), end(aln))
+    )
+
+    # aggregate reads by position and count them
+    readsPerPosition <- aln[,list(count=.N), by=list(strand, seqnames, pos)]$count
+
+    # PBC = positions with exactly 1 read / positions with at least 1 read
+    PBC <- data.frame(lib = str_split(IP, "/", simplify = T)[, 5],
+                      PBC1 = sum(readsPerPosition == 1) / length(readsPerPosition))
+                      
+    return(PBC)
+}
+
+PBC_df1 <- str_c(wd, str_subset(dir(wd), "A7"), "/bam/gsc.sorted.bam") %>% 
+	map(PBC) %>% 
+	bind_rows()
+	
+saveRDS(PBC_df1, str_c(wd, "R_objects/PBC_df1.rds"))
+```
+
+```{r, echo=FALSE}
+PBC_df1 <- readRDS(str_c(wd, "R_objects/PBC_df1.rds"))
+kable(PBC_df1)
+```
+
+> Consistent with the NRF values, these PBC values indicate that our ChIP samples have lower library complexity compared to our input samples. According to ENCODE guidelines, our ChIP librarires have moderate PCR bottlenecking (0.5 < PBC < 0.8) while our input libraries have mild PCR bottlenecking (0.8 < PBC < 0.9). 
+
+### **Visualization of Read Coverage Across Chromosome 1** <a name="pbc"></a>
+
+As part of his QC pipeline, Misha looks at the read coverage across a random region (in this case, a portion of Chromosome 1). Here, a bin size of 175bp is used.
+```
+# bin genome into 175 bp bins
+./objects/genome_175bp.bed :
+        bedtools makewindows -g ./hg19_chromsizes.tsv -w 175 | sort-bed --max-mem 20G --tmpdir ./tmp - > $@
+
+# convert BAM files to BEDs, find read centers, then calculate how many read centers in each 175 bp genome bin
+gcov = $(foreach lib, ${libs}, ./$(lib)/bam/cov_in_genomebins.bed)
+gcovs : ${gcov}
+
+%/bam/cov_in_genomebins.bed :
+        ${bedops}/convert2bed --input=bam < $*/bam/gsc.bam | cut -f 1-3 | \
+        awk '{printf("${PERCENT}i\t${PERCENT}i\n",$$1, ((($$3 - $$2)/2) + $$2))}' | \
+        awk '{print $$1"\t"$$2"\t"$$2 + 1}' | sort-bed --max-mem 20G --tmpdir ./tmp - | \
+        ${bedtools}/coverageBed -a - -b ./objects/genome_175bp.bed -counts > $@
+
+cov_in_chr1_loop = $(foreach lib, ${libs}, ./$(lib)/bam/cov_in_chr1_bins.bed)
+cov_in_chr1 : ${cov_in_chr1_loop}
+
+%/bam/cov_in_chr1_bins.bed :
+        cat $*/bam/cov_in_genomebins.bed | awk '{if ($$1 == 1) {print}}' > $@
+```
+
+```{r}
+libpairs <- fread(str_c(wd, "lib_pairs.tsv"), sep = '\t', header = F, stringsAsFactors = F) %>% 
+  unite(sep = ":") %>% unlist()
+
+read_cov_in_chr1 <- function(x, flagstats) {
+  ip <- gsub(":.*", "", x)
+  input <- gsub(".*:", "", x)
+  
+  mapped_ip <- flagstats[flagstats$lib == ip, ]$mapped
+  mapped_input <- flagstats[flagstats$lib == input, ]$mapped
+  
+  col_names <- c("chr", "start", "end", "cov")
+  
+  df_IP <- fread(str_c(wd, ip, "/bam/cov_in_chr1_bins.bed"), sep = '\t', header = F, stringsAsFactors = F, col.names = col_names) %>% 
+    mutate(type = "ChIP", lib = ip)
+  
+  df_input <- fread(str_c(wd, input, "/bam/cov_in_chr1_bins.bed"), sep = '\t', header = F, stringsAsFactors = F, col.names = col_names) %>% 
+    mutate(type = "Input", lib = input)
+  
+  df_pair <- rbind(df_IP, df_input)%>% 
+    mutate(pos = start + 87.5,
+           norm = if_else(type == "ChIP", (cov * 1e9) / (mapped_ip * 175), (cov * 1e9) / (mapped_input * 175)),
+           log_norm = if_else(type == "ChIP", log10(norm + 1), log10(norm + 1) * -1))
+  
+  corr <- signif(cor(df_pair[df_pair$type == "ChIP", ]$norm,
+                     df_pair[df_pair$type == "Input", ]$norm, 
+                     method = "spearman"), 4)
+  
+  df_pair$pair <- str_c(ip, " vs ", input, ", corr = ", corr)
+  
+  return(df_pair)
+}
+
+all_cov_in_chr1_reg <- map(libpairs, read_cov_in_chr1, flagstats = flagstats_1) %>% 
+  bind_rows() %>% 
+  filter(pos > 550000, pos < 1175000) %>% 
+  mutate(type = as.factor(type))
+saveRDS(all_cov_in_chr1_reg, str_c(wd, "R_objects/all_cov_in_chr1_reg.rds"))
+
+pdf(file = str_c(figs_path, "first_submission/IP_vs_input_chr1_region.pdf"), width = 12, height = 10)
+ggplot(all_cov_in_chr1_reg, aes(pos, log_norm, fill = fct_rev(type))) + 
+  geom_bar(stat = "identity", position = "stack") + 
+  facet_wrap(~pair, ncol = 1) + 
+  ylim(c(-2, 2)) +
+  labs(x = "Genomic Coordinate", y = "Normalized Coverage (SPKM)", fill = NULL) +
+  scale_fill_manual(values = c("snow3", "steelblue")) +
+  theme(axis.title = element_text(size = 16),
+        panel.background = element_rect(fill = NA),
+        legend.position = "top",
+        legend.text = element_text(size = 16),
+        strip.text = element_text(size = 16, face = "bold"))
+dev.off()
+```
+
+<center><img src="figs/CIC_ChIP/first_submission/IP_vs_input_chr1_region.pdf">
+<br><a href="figs/CIC_ChIP/first_submission/IP_vs_input_chr1_region.pdf">(Download pdf)</A></center>    
+
+> The concern that arose from this QC analysis was that the IPs and their respective inputs appeared to mirror each other, where normally input samples should have a relatively uniform distribution of reads. Since there was no indication of PCR bias in the input libraries, this uneven distribution must be due to other technical reasons such as sonication bias. We also observe that replicate 1 has higher correlation between the IP and input libraries with low coverage in the IP compared to the input.
+
+### **Visualizing BigWig Files** <a name="bw"></a>
+
+One of the first and simplest step in assessing the success of a ChIP-seq experiment is to visualize the data in a genome browswer. To do this, [deeptools/bamCoverage](https://deeptools.readthedocs.io/en/develop/content/tools/bamCoverage.html) was used to generate BigWig files from our bam files. Here, a bin size of 10 is specified and coverage is normalized using RPKM. BigWig files can be uploaded onto IGV or the UCSC genome browser for visualization.
+
+```
+bam_to_bw = $(foreach lib, ${libs}, $(lib)/bam/gsc.sorted.bam.bw)
+bams_to_bw : ${bam_to_bw}
+
+%/bam/gsc.sorted.bam.bw :
+        ${deeptools}/bamCoverage -p 20 -b $*/bam/gsc.sorted.rpkm.bam -o $@ \
+        --binSize 10 \
+        --normalizeUsing RPKM \
+        --ignoreForNormalization chrX \
+        --extendReads
+
+# prepare files for UCSC upload        
+ucsc_loop = $(foreach lib, ${libs}, $(lib)/ucsc_bam.bw)
+ucsc : ${ucsc_loop}
+
+%/ucsc_bam.bw :
+        cp $*/bam/gsc.sorted.bam.bw /gsc/www/bcgsc.ca/downloads/sdlee/CIC/$*.bam.sorted.bw; \
+        echo "track type=bigWig name='$*' description='$*' \
+        color=0,0,255 bigDataUrl=http://bigwigviewer:bwvbwv@www.bcgsc.ca/downloads/sdlee/CIC/$*.bam.sorted.bw" >> upload
+```
+
+<center><img src="figs/CIC_ChIP/first_submission/CIC positive targets.png"">
+<br><a href="figs/CIC_ChIP/first_submission/CIC positive targets.png">(Download PNG)</A></center>      
+
+> Here are IGV snapshots of the promoter regions of some known CIC targets including ETV4, ETV5, GPR3 and DUSP4. We can see very clear accumulations of reads or 'peaks' at these regions, as expected. This gives us some reassurance that the ChIPs worked.
+
+### **Correlations Between Samples** <a name="corr"></a>
+
+To assess the reproducibility of our replicates, we can look at the correlation between read coverages for different samples. We should expect that ChIP samples should look more similar to each other than the input samples. [deepTools/multiBigwigSummary](https://deeptools.readthedocs.io/en/develop/content/tools/multiBigwigSummary.html) followed by [deepTools/plotCorrelation](https://deeptools.readthedocs.io/en/develop/content/tools/plotCorrelation.html) was used to compute average scores across genomic bins for each BigWig file from which a Spearman correlation heatmap was generated. This can also be performed on bam files using [deepTools/multiBamSummary](https://deeptools.readthedocs.io/en/develop/content/tools/multiBamSummary.html) which results in very similar correlation values (at least with these 4 samples). I prefer doing this analysis on the bigwig files since you use normalized read coverages rather than raw values to compute average scores.
+
+```
+bigwigs = $(shell ls ./*/bam/gsc.filt.sorted.bam.bw)
+
+corr_bw :
+        ${deeptools}/multiBigwigSummary bins \
+        -p 10 \
+	      --bwfiles ${bigwigs} \
+        --labels NHA_rep1_chip NHA_rep1_input NHA_rep2_chip NHA_rep2_input \
+        -out objects/bw_readCounts.npz \
+        --outRawCounts objects/bw_readCounts.tab
+
+corr_bw_sp_heatmap :
+        ${deeptools}/plotCorrelation \
+        -in objects/bw_readCounts.npz \
+        --corMethod spearman --skipZeros \
+        --plotTitle "Spearman Correlation of Normalized Read Counts" \
+        --whatToPlot heatmap --colorMap RdYlBu --plotNumbers \
+        -o figs/QC_SL/heatmap_sp_bw_readCounts.png \
+        --outFileCorMatrix objects/spearman_readCounts.tab
+```
+
+<center><img src="figs/CIC_ChIP/first_submission/bw_sp_corr_heatmap.png">
+<br><a href="figs/CIC_ChIP/first_submission/bw_sp_corr_heatmap.png">(Download PNG)</A></center>    
+
+> Normalized read counts are highly correlated between the ChIP and input sample in replicate 1. NHA_rep2_chip appears to be less correlated with all other samples, with the lowest correlation against NHA_rep1_chip. This is concerning since we expect that ChIP replicates to be more correlated to each other than their respective input samples. We'll keep in mind that ChIP rep1 is more correlated to its matched input than ChIP rep2 is to theirs. 
+
+### **Fingerprint Profiles** <a name="finger"></a>
+
+To assess the quality of how well the ChIP worked, [deepTools/plotFingerprint](https://deeptools.readthedocs.io/en/develop/content/tools/plotFingerprint.html) based on [Diaz et al](https://www.ncbi.nlm.nih.gov/pubmed/22499706) provides a visualization to determine how well the ChIP signal can be separated from the background input noise. The per-base coverage sum in randomly sampled genome bins (default 500bp) are sorted according to rank and the cumulative sum of read counts is plotted. Ideal input samples with uniform genomic coverage are represented by a near straight diagonal line while high quality ChIP samples display a positive inflection toward the highest rank, indicating a high enrichment of reads in a specific set of regions. Hence, factors that enrich well-defined, narrow regions will exhibit greater separation between the ChIP and input fingerprint. Conversely, the plot will be less clear for factors with more broad enrichment profiles.
+
+```
+fingerprint :
+  ${deeptools}/plotFingerprint \
+  -b ${bams} -p10 \
+  --extendReads \
+  --labels NHA_rep1_chip NHA_rep1_input NHA_rep2_chip NHA_rep2_input \
+  --minMappingQuality 30 --skipZeros \
+  -T "Fingerprints of First Submission Samples"  \
+  --plotFile figs/QC_SL/fingerprints.png \
+  --outRawCounts objects/fingerprints.tab
+```
+
+<center><img src="figs/CIC_ChIP/first_submission/fingerprints.png">
+<br><a href="figs/CIC_ChIP/first_submission/fingerprints.png">(Download PNG)</A></center>    
+
+> This plot raises some immediate concerns about our samples. Most obviously, the fingerprints for the input samples indicate high enrichment of reads in a subset of regions - even more so than the ChIP samples. Secondly, there is a clear difference between the ChIP replicates; ~25% of genomic bins contain ~80% of reads in replicate 1 while <5% of genomic bins contain >50% of the reads in replicate 2. In other words, it appears that replicate 2 contains few regions that are very highly enriched compared to replicate 1 - this profile is typical for ChIPs that enrich for well-defined and narrow regions such as the histone mark h3k4me3. 
+
+### **Cross-Correlation Analysis** <a name="cross"></a>
+
+A high-quality ChIP-seq library will have accumulations of reads on the forward and reverse strand that are positioned from the binding site center at a distance that depends on the fragment size distribution while a good input library will lack these clustering of fragments. One can assess the ChIP signal-to-noise ratio independently of peak calling by incrementally shifting one strand to the other and looking at the cross-correlation between the two strands at each shift value [Landt et al. 2012](https://www.ncbi.nlm.nih.gov/pubmed/29528371). By looking at this strand shift profile, it is expected that ChIP samples will exhibit two peaks: one corresponding to the predominant fragment length and a "phantom" peak corresponding to the read length. On the other hand, input samples are expected to show only the read length peak. The normalized strand cross-correlation coefficient (NSC) and the relative strand cross-correlation coefficient (RSC) are robust metrics that can be calculated from a cross-correlation analysis. NSC is calculated as fraglengthCC / minCC and RSC is calculated as (fraglengthCC - minCC) / (readlengthCC / minCC).    
+    
+Here, we use the [SSP package](https://github.com/rnakato/SSP) developed by [Nakato R et al 2018](https://www.ncbi.nlm.nih.gov/pubmed/29528371) to obtain a strand shift profile. SSP implements the jaccard index to calculate the NSC and RSC. **NOTE:** SSP requires GLIBC_2.14 or higher - since marrahost01/02 is on centos6 which only has GLIBC_2.13, run the following in gphost01 or any other server that has GLIBC_2.14. Also need to add samtools and R to path in gphost01: ```export PATH=/projects/jtopham_prj/installs/samtools-1.5:/gsc/software/linux-x86_64-centos6/R-3.3.2/lib64/R/bin:$PATH```    
+
+```
+ssp = /projects/sdlee_prj/installs/SSP/bin/ssp
+
+ssp_loop = $(foreach lib, ${libs}, $(lib)/bam/ssp)
+ssp : ${ssp_loop}
+
+%/bam/ssp :
+        ${ssp} -p10 \
+        -i $*/bam/gsc.sorted.bam \
+        -o ssp \
+        --odir $*/bam/ssp \
+        --pair \
+        --gt ${pd}hg19_chromsizes.txt
+```
+
+Import SSP output into R:
+
+```
+read_ssp_stats <- function(x) {
+    df <- fread(x, nrows = 6, col.names = c("stat", "value")) %>%
+      column_to_rownames("stat") %>% 
+      t() %>% as.data.frame() %>% 
+      mutate(lib = str_split(x, "/", simplify = T)[, 5])
+    
+    colnames(df) <- c("NSC", "RSC", "RLSC", "est_frag_len", "background_enrichment", "background_uniformity", "lib")
+    
+    return(df)
+}
+
+ssp_stats_1 <- str_c(wd, dir(wd, "A7"), "/bam/ssp/ssp.jaccard.csv") %>% 
+  map(read_ssp_stats) %>% 
+  bind_rows() %>% 
+  mutate(sample = if_else(lib %in% c("A77579", "A77580"), "NHA_rep1", "NHA_rep2"),
+         type = if_else(lib %in% c("A77579", "A77581"), "ChIP", "Input"))
+
+saveRDS(ssp_stats_1, str_c(wd, "R_objects/ssp_stats.rds"))
+```
+
+```{r, echo=FALSE}
+ssp_stats_1 <- readRDS(str_c(wd, "R_objects/ssp_stats.rds"))
+kable(ssp_stats_1)
+```
+
+> SSP calculates several metrics based on the strand shift profile. [Nakato R et al 2018](https://www.ncbi.nlm.nih.gov/pubmed/29528371) recommends that point-source ChIP samples have an NSC of >= 5 and input samples have an NSC of <= 2 - our first ChIP replicate and the two input samples fail to meet these suggestions. The background uniformity (Jaccard score of completely uniform sample / Jaccard score of sample) indicates that the first input replicate is the least uniform. This sample also has the shortest estimated fragment length (132bp) which may have contributed to the high sonication bias (regions that are more sensitive to mechanical breakage [i.e. open chromatin regions] may be overrepresented) that is explaining its high NSC score and low background uniformity. According to Andy Mungall, chromatin is typically sonicated to a range of ~200-500bp for histone ChIP-seq. Both input samples are well below this range - given how noisy these sample are, we should aim to decrease the amount of sonication for future replicates. Also of note, fragment length of ChIP samples are larger than input samples - this is typical to see for histone ChIP-seq samples.
+
+```
+read_ssp <- function(x) {
+    df <- fread(x, skip = 6, col.names = c("strand_shift", "jaccard_index", "proportion", "norm_jaccard", "rel_jaccard_to_bg")) %>% 
+      mutate(lib = str_split(x, "/", simplify = T)[, 5])
+    
+    return(df)
+}
+
+ssp_1 <- str_c(wd, dir(wd, "A7"), "/bam/ssp/ssp.jaccard.csv") %>% 
+  map(read_ssp) %>% 
+  bind_rows() %>% 
+  mutate(sample = if_else(lib %in% c("A77579", "A77580"), "NHA_rep1", "NHA_rep2"),
+         type = if_else(lib %in% c("A77579", "A77581"), "ChIP", "Input"))
+
+theme_1 <- theme(axis.text = element_text(size = 15),
+        axis.title = element_text(size = 18),
+        strip.text = element_text(size = 16),
+        legend.text = element_text(size = 15),
+        panel.grid.major = element_line(linetype = "dotted", colour = "gainsboro"))
+
+pdf(file = str_c(figs_path, "first_submission/ssp_strand_profile.pdf"), width = 10)
+ggplot(ssp_1, aes(strand_shift, norm_jaccard, col = type)) +
+  geom_line(data = subset(ssp_1, strand_shift > 0 & strand_shift < 500), alpha = 0.8, size = 1) +
+  facet_wrap(~sample) +
+  labs(x = "Strand Shift", y = "Jaccard Index", col = NULL) +
+  scale_color_manual(values = c("steelblue", "snow3")) +
+  theme_1
+dev.off()
+```
+
+<center><img src="figs/CIC_ChIP/first_submission/ssp_strand_profile.pdf">
+<br><a href="figs/CIC_ChIP/first_submission/ssp_strand_profile.png">(Download pdf)</A></center>    
+
+> In agreement with the input samples displying enrichment, strand shift profiles for these libraries peak at their estimated fragment length rather than the read length. There is also a huge difference between the strand profiles for the ChIP samples, with the first replicate samples having much lower jaccard indeces overall. 
+
+### **Call Peaks Using FindERv2** <a name="finder"></a>
+
+Virtually all ChIP-seq analyses involve identifying enriched regions called peaks. Many peak calling algorithms have been developed, the most widely used being MACS2. 
+http://www.epigenomes.ca/tools-and-software/finder **NOTE: add SHELL := /bin/bash somewhere in your makefile or the paste command will result in an error**
+
+```
+SHELL := /bin/bash
+lib_pairs = $(shell cat lib_pairs.tsv | awk '{print$$1"__"$$2}')
+
+runFinder = $(foreach lib_pair, ${lib_pairs}, $(lib_pair)/peaks.bed)
+callpeaks : ${runFinder}
+
+%/peaks.bed :
+	      ip=$$(echo $* | awk '{ gsub("__.*", ""); print }'); \
+        input=$$(echo $* | awk '{ gsub(".*__", ""); print }'); \
+        ${java} -jar -Xmx20G ${finder} -signalBam \
+        ./$${ip}/bam/gsc.sorted.bam -inputBam ./$${input}/bam/gsc.sorted.bam \
+        -out ./$${ip}/peaks/; gunzip -c \
+        ./$${ip}/peaks/gsc.sorted.vs.gsc.sorted.FDR_0.05.FindER.bed.gz | \
+        awk '{gsub("chr", "");print}' | \
+        ${bedops}/sort-bed --max-mem 20G --tmpdir ./tmp - \
+        > ./$${ip}/peaks/peaks.sorted.bed; \
+        rm ./$${ip}/peaks/gsc.sorted.vs.gsc.sorted.FDR_0.05.FindER.bed.gz
+
+# obtain raw coverage, dupes included, in peaks
+peakcov_loop = $(foreach lib, ${libs_no_input}, $(lib)/peaks/cov_in_peaks.bed)
+peakcov : ${peakcov_loop}
+
+%/peaks/cov_in_peaks.bed :
+        ip=$$(echo $* | awk '{ gsub("__.*", ""); print }'); \
+        input=$$(echo $* | awk '{ gsub(".*__", ""); print }'); \
+        ${bedtools}/coverageBed -abam $${ip}/bam/gsc.sorted.bam -b \
+        $${ip}/peaks/peaks.sorted.bed -counts | \
+        ${bedops}/sort-bed --max-mem 20G --tmpdir ./tmp - > $${ip}/peaks/cov_in_peaks.bed; \
+        ${bedtools}/coverageBed -abam $${input}/bam/gsc.sorted.bam -b \
+        $${ip}/peaks/peaks.sorted.bed -counts | \
+        ${bedops}/sort-bed --max-mem 20G --tmpdir ./tmp - > $${input}/peaks/cov_in_ip_peaks.bed; \
+        paste $${ip}/peaks/cov_in_peaks.bed <(awk '{print $$5}' $${input}/peaks/cov_in_ip_peaks.bed) > \
+        $${ip}/peaks/cov_in_peaks.bed
+
+# annotate peaks to nearest tss
+peaks_tss_loop = $(foreach lib, ${libs_no_input}, $(lib)/peaks/cov_in_peaks_tss.bed)
+peaks_tss : ${peaks_tss_loop}
+
+%/peaks/cov_in_peaks_tss.bed :
+        ${bedops}/closest-features --dist --closest --delim '\t' \
+        $*/peaks/cov_in_peaks.bed ${pd}/tss_pad_1500_500.bed > $@
+```
+
+#### **FindER Peaks QC** <a name="peaks"></a>
+
+```
+read_peaks_tss <- function(x, flagstats, peak_caller, sub) {
+  ip <- gsub(":.*", "", x)
+  input <- gsub(".*:", "", x)
+  
+  #as.numeric is used to prevent integer overflow while calculating spkm
+  mapped_ip <- as.numeric(flagstats[flagstats$lib == ip, ]$mapped)
+  mapped_input <- as.numeric(flagstats[flagstats$lib == input, ]$mapped)
+  
+  path <- ifelse(sub == 1, wd, wd2)
+  file <- ifelse(peak_caller == "finder", 
+                 str_c(path, ip, "/peaks/cov_in_f_peaks_tss.bed"), 
+                 str_c(path, ip, "/peaks/cov_in_mq0.01_peaks_tss.bed"))
+  
+  if (peak_caller == "finder") {
+    colnames <- c("chr", "start", "end", "log10_pval", "cov_ip", "cov_input", "X1", "X2", "X3", "strand", 
+                  "ensg_ID", "gene_name", "enst_ID", "X4", "X5", "tss", "X6")
+  } else {
+    colnames <- c("chr", "start", "end", "X1", "X2", "X3", "fold_change", "log10_pval", "log10_qval", "summit_pos_from_start", "cov_ip", 
+                  "cov_input", "X5", "X6", "X7", "strand", "ensg_ID", "gene_name", "enst_ID", "X8", "X9", "tss", "X10")
+  }
+  
+  df <- fread(file, fill = T, col.names = colnames) %>% 
+    select(-contains("X")) %>% 
+    mutate(lib = ip,
+           p_value = 10 ^ -log10_pval,
+           peak_size = abs(start - end),
+           peak_center = (end + start) / 2, 
+           dist_to_tss = abs(peak_center - tss),
+           norm_ip = (cov_ip * 1e9) / (mapped_ip * peak_size),
+           norm_input = (cov_input * 1e9) / (mapped_input * peak_size))
+           
+  return(df)  
+}
+
+lib_pairs_1 <- c("A77579:A77580", "A77581:A77582")
+
+f_peaks_tss_1 <- lib_pairs_1 %>% 
+  map(read_peaks_tss, flagstats_1, "finder", 1) %>% 
+  bind_rows() %>% 
+  filter(chr %in% c(1:22, "X", "Y")) %>% 
+  mutate(sample = if_else(lib == "A77579", "NHA_rep1", "NHA_rep2"))
+
+saveRDS(f_peaks_tss_1, str_c(wd, "R_objects/f_peaks_tss.rds"))
+f_peaks_tss_1 <- readRDS(str_c(wd, "R_objects/f_peaks_tss.rds"))
+
+f_peaks_1_summary <- f_peaks_tss_1 %>% 
+  summarize_peaks(flagstats_1) %>% 
+  mutate(sample = if_else(lib == "A77579", "NHA_rep1", "NHA_rep2"))
+
+saveRDS(f_peaks_1_summary, str_c(wd, "R_objects/f_peaks_1_summary.rds"))
+```
+
+```{r, echo=FALSE}
+f_peaks_1_summary <- readRDS(str_c(wd, "R_objects/f_peaks_1_summary.rds"))
+kable(f_peaks_1_summary)
+```
+
+> There is clear discordance between the peak calling results of the two replicates. FindER identified a lot more peaks in replicate 2 (>100 fold over rep1). We can look at some of these peak attributes visually: 
+
+```
+my_theme <- theme(axis.text = element_text(size = 18, colour = "black"),
+                  axis.title = element_text(size = 20),
+                  panel.background = element_rect(fill = "white", colour = "black"),
+                  panel.grid.major.y = element_line(colour = "gainsboro"))
+
+# x is the combined peaks_tss files, y is the summary of peaks
+plot_peak_metrics <- function(x, y) {
+  pval_p <- ggplot(x, aes(x = sample, y = log10_pval, fill = sample)) +
+    geom_violin(size = 0.8, colour = "black") +
+    labs(x = NULL, y = "q-value (-log10)") +
+    theme(legend.position = "none",
+          axis.text.x = element_text(angle = 45, vjust = 0.5)) +
+    my_theme
+    
+  size_p <- ggplot(x, aes(x = sample, y = log10(peak_size), fill = sample)) +
+    geom_violin(size = 0.8, colour = "black") +
+    labs(x = NULL, y = "Peak Size (log10)") +
+    theme(legend.position = "none",
+          axis.text.x = element_text(angle = 45, vjust = 0.5)) +
+    my_theme
+
+  frip <- y %>% 
+    mutate(`Inside Peaks` = frip,
+           `Outside Peaks` = 100 - frip) %>% 
+    gather(reads, frip, `Outside Peaks`, `Inside Peaks`)
+
+  frip_p <- ggplot(frip, aes(x = sample, y = frip, fill = fct_rev(reads))) +
+    geom_col() +
+    scale_fill_manual(values = c("lavender", "slateblue3")) +
+    labs(x = NULL, y = "Fraction of Reads", fill = NULL) +
+    theme(legend.position = "bottom",
+          axis.text.x = element_text(angle = 45, vjust = 0.5)) +
+    my_theme
+  
+  plot_grid(pval_p, size_p, dist_p, frip_p, align = "v")
+}
+
+pdf(file = str_c(figs_path, "/first_submission/f_peak_metrics.pdf"), width = 10)
+plot_peak_metrics(f_peaks_tss_1, f_peaks_1_summary)
+dev.off()
+```
+
+<center><img src="figs/CIC_ChIP/first_submission/f_peak_metrics.pdf">
+<br><a href="figs/CIC_ChIP/first_submission/f_peak_metrics.pdf">(Download pdf)</A></center>    
+
+> We can see that the two peak sets differ in their distribution of q values and peak size. Consistent with published CIC ChIP-seq results by [Weissmann et al. 2018](https://www.ncbi.nlm.nih.gov/pubmed/29844126), the majority of peaks appear to be located >10kb from transcriptional start sites. Replicate 2 had a much higher FRIP value but since much more peaks were called for this sample, this does not inform us of much. 
+
+Next, let's check the overlap between the two sets of peaks.
+
+```
+f_peaks_overlap_1 <- fread(str_c(wd, "objects/overlap_f_peaks.bed"))
+
+nrow(f_peaks_overlap_1) / nrow(f_peaks_tss_1) * 100
+
+nrow(mq0.01_peaks_tss_1)
+
+mq0.01_peaks_overlap_1 <- fread(str_c(wd, "objects/overlap_mq0.01_peaks.bed"))
+
+nrow(mq0.01_peaks_overlap_1) / nrow(mq0.01_peaks_tss_1) * 100
+
+head(f_peaks_1_summary)
+head(mq0.01_peaks_1_summary)
+```
+
+### **Coverage in Peaks** <a name="cov_peaks"></a>
+
+To assess the validity of our peaks, we can look at the relative IP and input coverage levels within regions that were called as peaks. The expectation here is that the peaks will have high IP coverage and low input coverage. Here, I used hexbins instead of points to avoid excessive processing time and also labeled peaks located within 2kb of a TSS of high confidence known CIC targets. 
+
+```
+cic_targets <- c("ETV4", "ETV5", "DUSP4", "GPR3", "SPRY4")
+
+plot_cov_in_peaks <- function(x) {
+  ggplot(x, aes(log10(norm_input + 1), log10(norm_ip + 1))) +
+    geom_hex(size = 1, col = "grey") +
+    geom_point(data = subset(x, gene_name %in% cic_targets & dist_to_tss < 2000), size = 1.5, col = "coral1") +
+    geom_text_repel(data = subset(x, gene_name %in% cic_targets & dist_to_tss < 2000), aes(label = gene_name), 
+									  size = 4, fontface = "bold", arrow = arrow(length = unit(0.02, "npc"))) +
+	  geom_abline(slope = 1, intercept = 0, col = "black", linetype = "dashed") +
+    facet_wrap(~sample, nrow = 2) +
+    labs(x = "Normalized Coverage in Input (log10)", y = "Normalized Coverage in IP (log10)", fill = "Count") +
+    scale_fill_gradient(low = "seagreen1", high = "seagreen4") +
+    coord_fixed() +
+    theme(legend.position = c(0.9, 0.2)) +
+    theme_1
+}
+
+pdf(file = str_c(figs_path, "first_submission/cov_in_f_peaks.pdf"), width = 10)
+plot_cov_in_peaks(f_peaks_tss_1)
+dev.off()
+```
+
+<center><img src="figs/CIC_ChIP/first_submission/cov_in_f_peaks.pdf">
+<br><a href="figs/CIC_ChIP/first_submission/cov_in_f_peaks.pdf">(Download pdf)</A></center>    
+
+> We can see that for rep1, a majority of peaks seem to actually have higher input than IP coverage while Rep2 appears to have more peaks with good IP over input coverage. As expected, peaks identifed in the promoters of known CIC targets appear to have higher IP coverage. We can at least be assured that FindER is identifying peaks in regions we expect it to despite our noisy input samples. Filtering on peaks may be necessary to remove those with high input coverage.
+
+### **Coverage around Peaks** <a name="cov_peaks"></a>
+
+We can also visualize normalized coverage around regions called as peaks. To do this, the peaks are padded by 2kb from the center and binned by 100bp windows. Raw coverage in each bin is obtained: 
+
+```
+cov_around_finder_peaks_loop = $(foreach lib_pair, ${lib_pairs}, $(lib_pair)/cov_around_finder_peaks.bed)
+cov_around_finder_peaks : ${cov_around_finder_peaks_loop}
+
+%/cov_around_finder_peaks.bed :
+        ip=$$(echo $* | awk '{ gsub("__.*", ""); print }'); \
+        input=$$(echo $* | awk '{ gsub(".*__", ""); print }'); \
+        ${bedtools}/coverageBed -abam $${ip}/bam/gsc.sorted.bam \
+        -b $${ip}/peaks/finder_peaks_padbin.bed -counts | \
+        ${bedops}/sort-bed --max-mem 20G --tmpdir ./tmp - > $${ip}/peaks/finder_peaks_padbin_cov.bed; \
+        ${bedtools}/coverageBed -abam $${input}/bam/gsc.sorted.bam \
+        -b $${ip}/peaks/finder_peaks_padbin.bed -counts | \
+        ${bedops}/sort-bed --max-mem 20G --tmpdir ./tmp - > $${input}/peaks/finder_peaks_padbin_cov.bed; \
+        # add input coverage as the last column
+        paste $${ip}/peaks/finder_peaks_padbin_cov.bed <(awk '{print $$5}' $${input}/peaks/finder_peaks_padbin_cov.bed) > \
+        $${ip}/peaks/both_finder_peaks_padbin_cov.bed
+```
+
+We can now import the raw coverage values in the padded bins and plot their average, normalized values. The expectation here is that IP samples will exhibit a clear accumulation of signal at the peak center while IP samples will exhibit a relatively flat signal profile. 
+
+```
+read_padbin_peaks <- function(x, flagstats, peak_caller, sub) {
+  ip <- gsub(":.*", "", x)
+  input <- gsub(".*:", "", x)
+  
+  #as.numeric is used to prevent integer overflow while calculating spkm
+  mapped_ip <- as.numeric(flagstats[flagstats$lib == ip, ]$mapped)
+  mapped_input <- as.numeric(flagstats[flagstats$lib == input, ]$mapped)
+  
+  path <- ifelse(sub == 1, wd, wd2)
+  file <- ifelse(peak_caller == "finder", 
+                 str_c(path, ip, "/peaks/both_f_peaks_padbin_cov.bed"), 
+                 str_c(path, ip, "/peaks/both_mq0.01_peaks_padbin_cov.bed"))
+  
+  df <- fread(file, col.names = c("chr", "start", "end", "id", "cov_ip", "cov_input")) %>% 
+    mutate(lib = ip,
+           # position is the bin number
+           pos = as.numeric(str_replace(id, "_", "")),
+           # our peaks are padded into 40 bins of 100bp, the following = the distance of bin center to peak center in kb
+           dist = (-50 - (100 * (20 - pos))) / 1000,
+           norm_ip = (cov_ip * 1e9) / (mapped_ip * 100),
+           norm_input = (cov_input * 1e9) / (mapped_input * 100),
+           logrpm_ip = log10(norm_ip + 1),
+           logrpm_input = log10(norm_input + 1))
+  
+  return(df)
+}
+
+f_padbin_peaks_1 <- lib_pairs_1 %>% 
+  map(read_padbin_peaks, flagstats_1, caller = "finder") %>% 
+  bind_rows()
+
+smooth_padbin_peaks <- function(x) {
+  df <- x %>% 
+    group_by(dist, lib) %>% 
+    summarize(ChIP = mean(logrpm_ip),
+              Input = mean(logrpm_input)) %>% 
+    gather(type, mean_logrpm, ChIP, Input)
+  
+  return(df)
+}
+
+f_padbin_peaks_1_smooth <- smooth_padbin_peaks(f_padbin_peaks_1) %>% 
+  mutate(sample = if_else(lib == "A77579", "NHA_rep1", "NHA_rep2"))
+
+plot_cov_across_peaks <- function(x) {
+  p <- ggplot(x, aes(dist, mean_logrpm, col = type)) +
+    geom_path(size = 1) +
+    xlim(c(-2, 2)) +
+    facet_wrap(~sample) +
+    scale_color_manual(values = c("steelblue", "snow3")) +
+    labs(x = "Distance from Peak Center (Kb)", y = "Normalized Coverage (Log10)", col = NULL) +
+    theme(legend.position = "bottom") +
+    theme_1
+    
+  return(p)
+}
+
+pdf(file = str_c(figs_path, "/first_submission/cov_across_f_peaks.pdf"), width = 10)
+plot_cov_across_peaks(f_padbin_peaks_1_smooth)
+dev.off()
+```
+
+<center><img src="figs/CIC_ChIP/first_submission/cov_across_f_peaks.pdf">
+<br><a href="figs/CIC_ChIP/first_submission/cov_across_f_peaks.png">(Download pdf)</A></center>    
+
+> It is not surprising that the input samples have a coverage profile resembling an IP based on previous QC, but at least the IP samples have greater mean coverage across peaks.
+
+### **Call Peaks using MACS2** <a name="macs2"></a>
+
+[ref](https://deeptools.readthedocs.io/en/develop/content/feature/effectiveGenomeSize.html)
+
+```
+macs2 = /projects/sdlee_prj/installs/python2.7.12_venv/bin/macs2
+
+macs2_loop = $(foreach lib_pair, ${lib_pairs}, $(lib_pair)/macs2.bed)
+macs2 : ${macs2_loop}
+
+# effective genome size for hg19 (75bp readlen) = 2736124973
+%/macs2.bed :
+	ip=$$(echo $* | awk '{ gsub("__.*", ""); print }'); \
+  input=$$(echo $* | awk '{ gsub(".*__", ""); print }'); \
+  ${macs2} callpeak -B \
+  -t $${ip}/bam/gsc.sorted.bam \
+  -c $${input}/bam/gsc.sorted.bam \
+  -f BAMPE \
+  -g 2736124973 \
+  -q 0.01 \
+  -n macs2_q0.01 \
+  --outdir $${ip}/peaks
+```
+
+```{r}
+mq0.01_peaks_tss_1 <- lib_pairs_1 %>% 
+  map(read_peaks_tss, flagstats_1, "macs2", 1) %>% 
+  bind_rows() %>% 
+  filter(chr %in% c(1:22, "X", "Y")) %>% 
+  mutate(sample = if_else(lib == "A77579", "NHA_rep1", "NHA_rep2"),
+         summit_pos = start + summit_pos_from_start,
+         summit_pos_from_center = summit_pos - peak_center,
+         fold_change_input = norm_ip - norm_input)
+
+saveRDS(mq0.01_peaks_tss_1, str_c(wd, "R_objects/mq0.01_peaks_tss.rds"))
+
+ggplot(mq0.01_peaks_tss_1, aes(lib, summit_pos_from_center)) +
+  geom_boxplot()
+
+ggplot(mq0.01_peaks_tss_1, aes(lib, peak_center)) +
+  geom_boxplot()
+
+ggplot(mq0.01_peaks_tss_1, aes(lib, fold_change_input)) +
+  geom_boxplot()
+
+ggplot(mq0.01_peaks_tss_1, aes(lib, fold_change)) +
+  geom_boxplot()
+
+mq0.01_peaks_tss_1_pos <- mq0.01_peaks_tss_1 %>%
+  filter(gene_name %in% cic_pos_genes)
+
+ggplot(mq0.01_peaks_tss_1_pos, aes(lib, fold_change_input)) +
+  geom_boxplot()
+
+mq0.01_peaks_tss_1_pos_best <- mq0.01_peaks_tss_1_pos %>% 
+  group_by(lib, gene_name) %>% 
+  filter(fold_change_input == max(fold_change_input))
+
+fc_threshold <- min(mq0.01_peaks_tss_1_pos_best$fold_change_input)
+
+mq0.01_peaks_tss_1_threshold <- mq0.01_peaks_tss_1 %>% 
+  filter(fold_change_input >= fc_threshold)
+
+G144_peaks <- read_excel("/projects/marralab_cic_prj/Weissman_et_al/paper_peaks/allpeaks.xls", sheet = 5) %>% 
+  select(chr = Chromosome, start = Start, end = End, gene_name = `Gene Name`) %>% 
+  mutate(gene_name = str_replace(gene_name, "-.*$", ""))
+
+read_mq0.01_i_G144 <- function(x) {
+  df <- fread(x, col.names = c("chr", "start", "end", "X1", "X2", "X3", "fold_change", "log10_pval", "log10_qval", "summit_pos_from_start", 
+                               "X5", "X6", "X7", "overlap", "X8", "X9", "X10", "strand", "ensg_ID", "gene_name", "enst_ID", "X11", "X12", "tss", "X13")) %>% 
+    select(-contains("X"))
+  
+  return(df)
+}
+
+mq0.01_i_G144_tss <- as.list(str_c(wd, c("A77579/peaks/mq0.01_i_G144_tss.bed", "A77581/peaks/mq0.01_i_G144_tss.bed"))) %>% 
+  map(read_mq0.01_i_G144) %>% 
+  bind_rows()
+
+a <- fread(str_c(wd, c("A77579/peaks/mq0.01_i_G144_tss.bed")))
+summarize_peaks <- function(x, flagstats) {
+  df <- x %>% 
+    group_by(lib) %>% 
+    summarize(n = n(), 
+            mean_peak_size = mean(peak_size), 
+            mean_dist_to_tss = mean(dist_to_tss), 
+            sum_cov = sum(cov_ip)) %>% 
+    # Fraction of reads in peaks (FRIP) -> proportion of mapped reads contributing to peaks (signal to noise ratio)
+    mutate(frip = sum_cov / flagstats$mapped[match(lib, flagstats$lib)] * 100)
+  
+  return(df)
+}
+
+mq0.01_peaks_1_summary <- mq0.01_peaks_tss_1 %>% 
+  summarize_peaks(flagstats_1) %>% 
+  mutate(sample = if_else(lib == "A77579", "NHA_rep1", "NHA_rep2"))
+
+saveRDS(mq0.01_peaks_1_summary, str_c(wd, "R_objects/mq0.01_peaks_1_summary.rds"))
+```
+
+```{r, echo=FALSE}
+mq0.01_peaks_1_summary <- readRDS(str_c(wd, "R_objects/mq0.01_peaks_1_summary.rds"))
+kable(mq0.01_peaks_1_summary)
+```
+
+```
+pdf(file = str_c(figs_path, "/first_submission/mq0.01_peak_metrics.pdf"), width = 10)
+plot_peak_metrics(mq0.01_peaks_tss_1, mq0.01_peaks_1_summary)
+dev.off()
+```
+
+<center><img src="figs/CIC_ChIP/first_submission/mq0.01_peak_metrics.pdf">
+<br><a href="figs/CIC_ChIP/first_submission/mq0.01_peak_metrics.pdf">(Download pdf)</A></center>    
+
+```
+pdf(file = str_c(figs_path, "first_submission/cov_in_mq0.01_peaks.pdf"), width = 10)
+plot_cov_in_peaks(mq0.01_peaks_tss_1)
+dev.off()
+```
+
+<center><img src="figs/CIC_ChIP/first_submission/cov_in_mq0.01_peaks.pdf">
+<br><a href="figs/CIC_ChIP/first_submission/cov_in_mq0.01_peaks.pdf">(Download pdf)</A></center>   
+
+```
+mq0.01_padbin_peaks_1 <- lib_pairs_1 %>% 
+  map(read_padbin_peaks, flagstats_1, peak_caller = "macs2", sub = 1) %>% 
+  bind_rows()
+  
+mq0.01_padbin_peaks_1_smooth <- smooth_padbin_peaks(mq0.01_padbin_peaks_1) %>% 
+  mutate(sample = if_else(lib == "A77579", "NHA_rep1", "NHA_rep2"))
+
+pdf(file = str_c(figs_path, "/first_submission/cov_across_mq0.01_peaks.pdf"), width = 10)
+plot_cov_across_peaks(mq0.01_padbin_peaks_1_smooth)
+dev.off()
+```
+
+<center><img src="figs/CIC_ChIP/first_submission/cov_across_mq0.01_peaks.pdf">
+<br><a href="figs/CIC_ChIP/first_submission/cov_across_mq0.01_peaks.pdf">(Download pdf)</A></center>
+
+### **First Submission Summary** <a name="summary1"></a>
+
+In summary, the following points can be made for this particular ChIP-seq submission:    
+- input samples are highly noisy, making it difficult for signal to be separated from noise. Based on the IGV snapshots we can clearly observe strong signal at positive control regions, indicating that the ChIP worked - the concern here is that regions that CIC may weakly bind to may be drowned out (high false negative rate). The most likly source for the noisy input samples is oversonication (fragments sizes were <200bp for input samples)    
+- there is high variability between the two replicates, possible contributers for this include variability in fragmentation (fragment size estimated at 132bp for input rep1 and 172bp for input rep2), variability in ChIP efficiency (could have been affected by previous reason) and variability in the amount of DNA submitted (2ng for ChIP rep 1 and 4.5ng for ChIP rep 2).    
+- it is difficult to conclude which replicate is better than the other (i.e. which replicate represents a more accurate profile of CIC binding). In my view, the second replicate appear to represent a more successful ChIP due to its superior strand shift profile and the fact that the ChIP and its match input are less correlated to each other than in the first replicate.    
+- based on this QC analysis, I can conclude that many of these problems can be potentially overcome by **decreasing the amount of sonication (aim for 200-500bp)** and by **submitting a greater amount of ChIP'ed DNA (at least 10ng)**     
+
+## **CIC ChIP Second Submission** <a name="overview"></a>
+
+----
+
+```
+sub2_samples <- str_c(rep(c("NHA","NHAA2", "F8", "F8E10"), each = 2), c("_rep1", "_rep2"))
+
+flagstats_2 <- str_c(wd2, str_subset(dir(wd2), "rep"), "/bam/flagstat.txt") %>% 
+	map(read_flagstats) %>% 
+	bind_rows() %>% 
+	separate(lib, c("sample", "rep", "type"), sep = "_", remove = F) %>% 
+	mutate(type = if_else(type == "chip", "ChIP", "Input")) %>% 
+	unite(sample, c("sample", "rep"), sep = "_")
+
+flagstats_2$sample <- factor(flagstats_2$sample, levels = sub2_samples)
+
+saveRDS(flagstats_2, str_c(wd2, "R_objects/flagstats.rds"))
+
+flagstats_2_m <- flag_m(flagstats_2)
+
+pdf(file = str_c(figs_path, "/second_submission/flagstats.pdf"), width = 12)
+ggplot(flagstats_2_m, aes(x = sample, y = value, fill = type)) + 
+  geom_col(width = 0.8, alpha = 0.8, size = 4, position = "dodge") +
+  scale_fill_manual(values = c("steelblue", "snow3")) +
+  facet_wrap(~variable, scales = "free") +
+	labs(x = NULL, y = NULL, fill = NULL) +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.25, hjust = 1),
+        axis.text.y = element_text(size = 13),
+        strip.background = element_rect(fill = "gainsboro", color = "black"),
+        strip.text = element_text(size = 14, color = "black", face = "bold"),
+        legend.text = element_text(size = 14))
+dev.off()
+```
+<center><img src="figs/CIC_ChIP/second_submission/flagstats.pdf"">
+<br><a href="figs/CIC_ChIP/second_submission/flagstats.pdf">(Download pdf)</A></center>
+
+> Compared to the flagstats of the first submission, these sample exhibit relatively little variability. A striking difference is the low duplicate rate (~1.5-2.5%) in these ChIP samples compared to the first submission. Also, F8E10 rep2 appears to have lower coverage compared to the rest of the samples. .
+
+#### **Visualizing BigWig Files** <a name="bw2"></a>
+
+As with the first submission, we can generate and look at the BigWigs files on IGV at the promoters of known CIC targets. In the interest of space, only the samples of the first replicate are shown here. All tracks are displayed on the same scale.    
+
+<center><img src="figs/CIC_ChIP/second_submission/CIC positive targets rep1.png">
+<br><a href="figs/CIC_ChIP/second_submission/CIC positive targets rep1.png">(Download PNG)</A></center>    
+
+<center><img src="figs/CIC_ChIP/second_submission/CIC positive targets rep2.png">
+<br><a href="figs/CIC_ChIP/second_submission/CIC positive targets rep2.png">(Download PNG)</A></center>    
+
+> In contrast to the first submission, there is a clear lack of a distinguishable 'peak' with high coverage in these regions. While we expect this to be true in the CIC CIC-KO samples, as we see here, the lack of signal in the CIC-WT ChIP samples is alarming. The NHA ChIP sample is almost indistinguishable from its matched input and while some signal can be seen in the F8 ChIP sample, it is much weaker compared to the sonicated ChIP libraries. 
+
+
+```{r}
+libpairs2 <- fread(str_c(wd2, "lib_pairs.tsv"), sep = '\t', header = F, stringsAsFactors = F) %>% 
+  unite(sep = ":") %>% unlist()
+
+read_cov_in_chr1 <- function(x, flagstats) {
+  ip <- gsub(":.*", "", x)
+  input <- gsub(".*:", "", x)
+  
+  mapped_ip <- flagstats[flagstats$lib == ip, ]$mapped
+  mapped_input <- flagstats[flagstats$lib == input, ]$mapped
+  
+  col_names <- c("chr", "start", "end", "cov")
+  
+  df_IP <- fread(str_c(wd, ip, "/bam/cov_in_chr1_bins.bed"), sep = '\t', header = F, stringsAsFactors = F, col.names = col_names) %>% 
+    mutate(type = "ChIP", lib = ip)
+  
+  df_input <- fread(str_c(wd, input, "/bam/cov_in_chr1_bins.bed"), sep = '\t', header = F, stringsAsFactors = F, col.names = col_names) %>% 
+    mutate(type = "Input", lib = input)
+  
+  df_pair <- rbind(df_IP, df_input)%>% 
+    mutate(pos = start + 87.5,
+           norm = if_else(type == "ChIP", (cov * 1e9) / (mapped_ip * 175), (cov * 1e9) / (mapped_input * 175)),
+           log_norm = if_else(type == "ChIP", log10(norm + 1), log10(norm + 1) * -1))
+  
+  corr <- signif(cor(df_pair[df_pair$type == "ChIP", ]$norm,
+                     df_pair[df_pair$type == "Input", ]$norm, 
+                     method = "spearman"), 4)
+  
+  df_pair$pair <- str_c(ip, " vs ", input, ", corr = ", corr)
+  
+  return(df_pair)
+}
+
+all_cov_in_chr1_reg2 <- map(libpairs2, read_cov_in_chr1, flagstats = flagstats_1) %>% 
+  bind_rows() %>% 
+  filter(pos > 550000, pos < 1175000) %>% 
+  mutate(type = as.factor(type))
+saveRDS(all_cov_in_chr1_reg, str_c(wd, "R_objects/all_cov_in_chr1_reg.rds"))
+
+pdf(file = str_c(figs_path, "first_submission/IP_vs_input_chr1_region.pdf"), width = 12, height = 10)
+ggplot(all_cov_in_chr1_reg, aes(pos, log_norm, fill = fct_rev(type))) + 
+  geom_bar(stat = "identity", position = "stack") + 
+  facet_wrap(~pair, ncol = 1) + 
+  ylim(c(-2, 2)) +
+  labs(x = "Genomic Coordinate", y = "Normalized Coverage (SPKM)", fill = NULL) +
+  scale_fill_manual(values = c("snow3", "steelblue")) +
+  theme(axis.title = element_text(size = 16),
+        panel.background = element_rect(fill = NA),
+        legend.position = "top",
+        legend.text = element_text(size = 16),
+        strip.text = element_text(size = 16, face = "bold"))
+dev.off()
+```
+
+#### **Correlations Between Samples** <a name="corr2"></a>
+
+<center><img src="figs/CIC_ChIP/second_submission/bw_sp_corr_heatmap.png">
+<br><a href="figs/CIC_ChIP/second_submission/bw_sp_corr_heatmap.png">(Download PNG)</A></center>
+
+> There appears to be three clusters in this correlation heatmap: one cluster with all the input samples, one cluster with almost all ChIP samples, and the last cluster including the NHA & NHAA2 replicate 2 ChIP samples which appear to be more similar to the input samples. The second replicate for NHA was prepared separately from all other samples; the lack of clustering between the second replicate ChIPs and the first replicate once again highlights the difficulty in reproducibility in preparing ChIP samples. 
+
+#### **Fingerprints** <a name="fprint2"></a>
+
+```{r, out.width="25%", echo=FALSE}
+fp_png1 <- str_c(figs_path, "second_submission/NHA_rep1_fingerprints.png")
+fp_png2 <- str_c(figs_path, "second_submission/NHA_rep2_fingerprints.png")
+fp_png3 <- str_c(figs_path, "second_submission/NHAA2_rep1_fingerprints.png")
+fp_png4 <- str_c(figs_path, "second_submission/NHAA2_rep2_fingerprints.png")
+
+knitr::include_graphics(c(fp_png1, fp_png2, fp_png3, fp_png4))
+```
+
+```{r, out.width="25%", echo=FALSE}
+fp_png5 <- str_c(figs_path, "second_submission/F8_rep1_fingerprints.png")
+fp_png6 <- str_c(figs_path, "second_submission/F8_rep2_fingerprints.png")
+fp_png7 <- str_c(figs_path, "second_submission/F8E10_rep1_fingerprints.png")
+fp_png8 <- str_c(figs_path, "second_submission/F8E10_rep2_fingerprints.png")
+
+knitr::include_graphics(c(fp_png5, fp_png6, fp_png7, fp_png8))
+```
+
+> While the fingerprints for these input samples resemble true input libraries much more closely than in the first submission, there is virtually no separation between the fingerprints for the ChIP samples and their matched inputs, indicating that all samples have the same degree of enrichment. 
+
+#### **Strand Shift** <a name="bw2"></a>
+
+```
+ssp_stats_2 <- str_c(wd2, dir(wd2, "rep"), "/bam/ssp/ssp.jaccard.csv") %>% 
+  map(read_ssp_stats) %>% 
+  bind_rows() %>% 
+  separate(lib, c("sample", "rep", "type"), sep = "_") %>% 
+  unite(sample, c("sample", "rep"), sep = "_") %>% 
+  mutate(type = if_else(type == "chip", "ChIP", "Input")) %>% 
+  select(sample, type, everything())
+
+ssp_stats_2$sample <- factor(ssp_stats_2$sample, levels = sub2_samples)
+
+saveRDS(ssp_stats_2, str_c(wd2, "R_objects/ssp_stats.rds"))
+```
+
+```{r, echo=FALSE}
+ssp_stats_2 <- readRDS(str_c(wd2, "R_objects/ssp_stats.rds"))
+kable(ssp_stats_2 %>% arrange(sample))
+```
+
+> Based on the estimated fragment length, we can see that the majority of our libraries consists primarily of fragments coming from mononucleosomes (~150-160bp) which is consistent with the gel QC. Based on the NSC scores, there is very low signal in these ChIP samples (all ChIP libraries are much lower than NSC = 5).  
+
+```
+ssp_2 <- str_c(wd2, dir(wd2, "rep"), "/bam/ssp/ssp.jaccard.csv") %>% 
+  map(read_ssp) %>% 
+  bind_rows() %>% 
+  separate(lib, c("sample", "rep", "type"), sep = "_") %>% 
+  unite(sample, c("sample", "rep"), sep = "_") %>% 
+  mutate(type = if_else(type == "chip", "ChIP", "Input"))
+
+ssp_2$sample <- factor(ssp_2$sample, levels = sub2_samples)
+
+pdf(file = str_c(figs_path, "second_submission/ssp_strand_profile.pdf"), width = 10)
+ggplot(ssp_2, aes(strand_shift, norm_jaccard, col = type)) +
+  geom_line(data = subset(ssp_2, strand_shift > 0 & strand_shift < 500), alpha = 0.8, size = 1) +
+  facet_wrap(~sample, nrow = 2) +
+  labs(x = "Strand Shift", y = "Jaccard Index", col = NULL) +
+  scale_color_manual(values = c("steelblue", "snow3")) +
+  theme(legend.position = "bottom") +
+  theme_1
+dev.off()
+```
+<center><img src="figs/CIC_ChIP/second_submission/ssp_strand_profile.pdf"">
+<br><a href="figs/CIC_ChIP/second_submission/ssp_strand_profile.pdf">(Download pdf)</A></center>
+
+> Like with the fingerprint profiles, matched ChIP and input pairs exhibit little to no difference in their strand shift profiles. The exception being F8E10_rep2 - remember that this replicate had the greatest difference in sequencing depth between its ChIP and input library. It also appears that the second replicate for NHA and NHAA2 have 'peakier' strand shift profiles than the others, this could be because of something that was different in the ChIP preparation for these samples (ChIP was performed for these two replicates separately from the rest) but it is unclear what the source is. 
+
+#### **FindER Peaks QC** <a name="peaks"></a>
+
+```
+lib_pairs_2 <- fread(str_c(wd2, "lib_pairs.tsv"), header = F, col.names = c("chip", "input")) %>% 
+  unite(pair, c("chip", "input"), sep = ":") %>% unlist()
+
+f_peaks_tss_2 <- lib_pairs_2 %>% 
+  map(read_peaks_tss, flagstats_2, "finder", 2) %>% 
+  bind_rows() %>% 
+  filter(chr %in% c(1:22, "X", "Y")) %>% 
+  mutate(sample = str_replace(lib, "_chip", ""))
+
+f_peaks_tss_2$sample <- factor(f_peaks_tss_2$sample, levels = sub2_samples)
+
+saveRDS(f_peaks_tss_2, str_c(wd2, "R_objects/f_peaks_tss.rds"))
+
+f_peaks_2_summary <- f_peaks_tss_2 %>% 
+  summarize_peaks(flagstats_2) %>% 
+  mutate(sample = str_replace(lib, "_chip", ""))
+
+f_peaks_2_summary$sample <- factor(f_peaks_2_summary$sample, levels = sub2_samples)
+
+saveRDS(f_peaks_2_summary, str_c(wd2, "R_objects/f_peaks_summary.rds"))
+```
+
+```{r, echo=FALSE}
+f_peaks_2_summary <- readRDS(str_c(wd2, "R_objects/f_peaks_summary.rds"))
+kable(f_peaks_2_summary)
+```
+
+```
+pdf(file = str_c(figs_path, "/second_submission/f_peak_metrics.pdf"), width = 14)
+plot_peak_metrics(f_peaks_tss_2, f_peaks_2_summary)
+dev.off()
+```
+
+<center><img src="figs/CIC_ChIP/second_submission/f_peak_metrics.pdf">
+<br><a href="figs/CIC_ChIP/second_submission/f_peak_metrics.pdf">(Download pdf)</A></center>    
+
+```
+pdf(file = str_c(figs_path, "second_submission/cov_in_f_peaks.pdf"), width = 12)
+plot_cov_in_peaks(f_peaks_tss_2) +
+  facet_wrap(~sample, nrow = 2) +
+  theme(legend.position = c(0.925, 0.125))
+dev.off()
+```
+
+<center><img src="figs/CIC_ChIP/second_submission/cov_in_f_peaks.pdf">
+<br><a href="figs/CIC_ChIP/second_submission/cov_in_f_peaks.pdf">(Download pdf)</A></center>    
+
+
+### **Coverage around Peaks** <a name="cov_peaks"></a>
+```
+f_padbin_peaks_2 <- lib_pairs_2 %>% 
+  map(read_padbin_peaks, flagstats_2, peak_caller = "finder", sub = 2) %>% 
+  bind_rows()
+
+f_padbin_peaks_2_smooth <- smooth_padbin_peaks(f_padbin_peaks_2) %>% 
+  mutate(sample = str_replace(lib, "_chip", ""))
+
+f_padbin_peaks_2_smooth$sample <- factor(f_padbin_peaks_2_smooth$sample, levels = sub2_samples)
+
+pdf(file = str_c(figs_path, "/second_submission/cov_across_f_peaks.pdf"), width = 12)
+plot_cov_across_peaks(f_padbin_peaks_2_smooth) +
+  facet_wrap(~sample, nrow = 2)
+dev.off()
+```
+
+<center><img src="figs/CIC_ChIP/second_submission/cov_across_f_peaks.pdf">
+<br><a href="figs/CIC_ChIP/second_submission/cov_across_f_peaks.pdf">(Download pdf)</A></center>    
+
+### **MACS2** <a name="macs2"></a>
+
+```
+mq0.01_peaks_tss_2 <- lib_pairs_2 %>% 
+  map(read_peaks_tss, flagstats_2, "macs2", 2) %>% 
+  bind_rows() %>% 
+  filter(chr %in% c(1:22, "X", "Y")) %>% 
+  mutate(sample = str_replace(lib, "_chip", ""))
+
+mq0.01_peaks_tss_2$sample <- factor(mq0.01_peaks_tss_2$sample, levels = sub2_samples)
+
+saveRDS(mq0.01_peaks_tss_2, str_c(wd2, "R_objects/mq0.01_peaks_tss.rds"))
+
+mq0.01_peaks_2_summary <- mq0.01_peaks_tss_2 %>% 
+  summarize_peaks(flagstats_2) %>% 
+  mutate(sample = str_replace(lib, "_chip", ""))
+
+mq0.01_peaks_2_summary$sample <- factor(mq0.01_peaks_2_summary$sample, levels = sub2_samples)
+
+saveRDS(mq0.01_peaks_2_summary, str_c(wd2, "R_objects/mq0.01_peaks_summary.rds"))
+```
+
+```{r, echo=FALSE}
+mq0.01_peaks_2_summary <- readRDS(str_c(wd2, "R_objects/mq0.01_peaks_summary.rds"))
+kable(mq0.01_peaks_2_summary)
+```
+
+```
+pdf(file = str_c(figs_path, "/second_submission/mq0.01_peak_metrics.pdf"), width = 14)
+plot_peak_metrics(mq0.01_peaks_tss_2, mq0.01_peaks_2_summary)
+dev.off()
+```
+
+<center><img src="figs/CIC_ChIP/second_submission/mq0.01_peak_metrics.pdf">
+<br><a href="figs/CIC_ChIP/second_submission/mq0.01_peak_metrics.pdf">(Download pdf)</A></center>    
+
+```
+pdf(file = str_c(figs_path, "second_submission/cov_in_mq0.01_peaks2.pdf"), width = 8)
+plot_cov_in_peaks(mq0.01_peaks_tss_2) +
+  facet_wrap(~sample, nrow = 4) +
+  theme(legend.position = c(0.925, 0.125))
+dev.off()
+```
+
+<center><img src="figs/CIC_ChIP/second_submission/cov_in_mq0.01_peaks.pdf">
+<br><a href="figs/CIC_ChIP/second_submission/cov_in_mq0.01_peaks.pdf">(Download pdf)</A></center>    
+
+```
+mq0.01_padbin_peaks_2 <- lib_pairs_2 %>% 
+  map(read_padbin_peaks, flagstats_2, peak_caller = "macs2", sub = 2) %>% 
+  bind_rows()
+
+mq0.01_padbin_peaks_2_smooth <- smooth_padbin_peaks(mq0.01_padbin_peaks_2) %>% 
+  mutate(sample = factor(str_replace(lib, "_chip", ""), levels = sub2_samples))
+
+mq0.01_padbin_peaks_2_smooth$sample <- factor(mq0.01_padbin_peaks_2_smooth$sample, levels = sub2_samples)
+
+pdf(file = str_c(figs_path, "/second_submission/cov_across_mq0.01_peaks.pdf"), width = 12)
+plot_cov_across_peaks(mq0.01_padbin_peaks_2_smooth) +
+  facet_wrap(~sample, nrow = 2)
+dev.off()
+```
+
+<center><img src="figs/CIC_ChIP/second_submission/cov_across_mq0.01_peaks.pdf">
+<br><a href="figs/CIC_ChIP/second_submission/cov_across_mq0.01_peaks.pdf">(Download pdf)</A></center>  
